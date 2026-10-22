@@ -8,6 +8,9 @@ gives them an OpenXR runtime, alvrxr, that streams each frame to the
 [ALVR](https://apps.apple.com/app/alvr/id6479728026) app on the Vision Pro and brings head,
 PS VR2 Sense controller and button input back. No PC and no SteamVR.
 
+**PlayStation VR2:** this fork also has a backend that shows games on a PS VR2 plugged into the
+Mac through Sony's PC adapter, with no Vision Pro. It is new and untested; see [PSVR2.md](PSVR2.md).
+
 Game audio streams to the headset with the video. OpenXR games (Beat Saber) run directly; OpenVR (SteamVR) games such as The Lab run through
 [OpenComposite](https://gitlab.com/znixian/OpenOVR), which MacVapoR downloads for you.
 

@@ -292,7 +292,7 @@ static XrResult xrGetSystemProperties_(XrInstance h, XrSystemId sys, XrSystemPro
     if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
     p->systemId = SYSTEM_ID;
     p->vendorId = 0x414c;
-    snprintf(p->systemName, sizeof p->systemName, "Apple Vision Pro (ALVR)");
+    snprintf(p->systemName, sizeof p->systemName, "%s", axr_system_name());
     p->graphicsProperties.maxSwapchainImageWidth = 8192;
     p->graphicsProperties.maxSwapchainImageHeight = 8192;
     p->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
