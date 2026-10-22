@@ -1,0 +1,105 @@
+# MacVapoR on a PlayStation VR2
+
+**Status: written but not yet run on hardware.** Expect to fix things on the first tries; the
+logs below are what to send back.
+
+This branch adds a second backend to alvrxr. In place of streaming to an Apple Vision Pro over
+ALVR, it drives a PS VR2 plugged into the Mac through Sony's PC adapter. Games run as in
+MacVapoR (NotProton, CrossOver, DXMT), and only the OpenXR runtime they load changes.
+
+What works in this first stage:
+
+- The game's frames on the headset, lens-corrected with the headset's own calibration.
+- Head rotation over USB, with a neck model for position.
+- Reprojection: each refresh shows the newest game frame turned by however far the head has moved
+  since it was rendered, so turning your head stays smooth when the game runs below the panel's
+  rate. That matters on a MacBook Air.
+- Recentering with the headset's Fn button.
+
+Not yet: the Sense controllers. Play games that work with a gamepad, which Wine passes to the
+game by itself. Room-scale position is experimental (see `positional` below).
+
+The headset code (USB protocol, lens correction, head tracking) comes from
+[psvr2-player-mac](https://github.com/ttkalec/psvr2-player-mac), which ports it from Monado's
+driver; see `src/psvr2/`.
+
+## What you need
+
+- An Apple silicon Mac with macOS 15 or later.
+- Sony's PS VR2 PC adapter with its power brick, and a USB-C to DisplayPort cable (DP 1.4).
+- MacVapoR installed and a game set up with it, as in the main README. You do not need a Vision
+  Pro for this; skip the ALVR steps.
+- Command Line Tools (`xcode-select --install`), Homebrew, and:
+
+      brew install libusb vulkan-headers
+      git clone https://github.com/KhronosGroup/OpenXR-SDK ~/Source/OpenXR-SDK
+
+## Hook the headset up
+
+1. Adapter power brick into the wall. DisplayPort cable from the adapter to the Mac. The adapter's
+   USB cable to the Mac's other port. The headset into the adapter.
+2. Turn the headset on. A display called "PS VR2" should appear in System Settings > Displays.
+3. Set it to **extend** the desktop (not mirror), at **90 Hz**, and pick **2000x1020** or
+   **4000x2040**.
+
+## Build
+
+    ./build-psvr2.sh
+
+This makes `out/libpsvr2xr.dylib` (the runtime) and `out/psvr2xr-selftest`.
+
+## Step 1: the self-test
+
+    out/psvr2xr-selftest
+
+Put the headset on. You should stand in a grey room with a 1 m floor grid and four pillars 3 m
+away: red ahead, green right, blue behind, yellow left. Check:
+
+- Grid lines look straight all the way to the edges of the view. Curved lines mean the lens
+  correction is off.
+- Turning your head moves the view the right way, and the pillars stay where they are.
+- Fn recenters you to face the red pillar.
+- Both eyes fuse into one 3D picture. If it looks doubled or uncomfortable, close it right away
+  and send me the log.
+
+Then try `out/psvr2xr-selftest --slow 2`, which renders only every other frame, like a game at
+45 fps. Head turns should still look smooth; the pillars may look slightly doubled when you move.
+
+## Step 2: a game
+
+    tools/psvr2-runtime.sh on
+
+Games set up by MacVapoR now load the PS VR2 runtime. Launch one from NotProton with the headset
+on. `tools/psvr2-runtime.sh off` switches back to the Vision Pro runtime.
+
+Start with a light, seated game that works with a gamepad. Games that need motion controllers
+will load but can't be played yet.
+
+## Settings
+
+`~/Library/Application Support/psvr2xr/config.json` is written with these defaults on the first
+run, and read when a game starts:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `render_scale` | 0.75 | Eye image size as a share of 2000x1906. Lower it if the game stutters. |
+| `eye_height` | 1.6 | Metres from the floor to your eyes, for the neck model. |
+| `reprojection` | true | Turns each frame with your head. Turn it off only to compare. |
+| `chromatic` | true | Per-colour lens correction. |
+| `lookahead_ms` | 0 | Adds to the head prediction. Raise it if the world seems to lag your head when you turn. |
+| `positional` | false | Experimental: use the headset's own position tracking instead of the neck model. The axes are a guess; if moving your head moves the world the wrong way, turn it back off and send me the log. |
+
+## Logs
+
+`~/Library/Logs/psvr2xr.log` gets a line every 5 seconds: the game's frame rate, how many frames
+the panel composed and repeated, whether the head is tracked, the IPD dial, and raw tracking
+numbers. Send it along with what you saw.
+
+## How it works
+
+`src/backend_psvr2.m` implements the interface `runtime.m` uses (`src/alvrxr.h`), as `backend.m`
+does for ALVR. A borderless window covers the headset's display, and a display link on that
+display composes the newest game frame at the panel's rate (`src/psvr2_compose.metal`). The
+runtime reports the field of view the lens correction expects, so the game renders exactly the
+area the lenses show. Each submitted frame is copied off the game's swapchain on the game's own
+queue, so the compositor can show it again on refreshes the game misses.

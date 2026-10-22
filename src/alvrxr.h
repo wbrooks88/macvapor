@@ -2,6 +2,8 @@
 // visionOS client shows the frames and supplies head, controller and button input.
 //
 // runtime.m is the OpenXR surface; backend.m owns ALVR, the compositor and the encoder.
+// backend_psvr2.m is the other implementation of this interface: a PS VR2 on the Mac's own
+// display output (build-psvr2.sh, PSVR2.md).
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,6 +33,8 @@ typedef struct {
 } axr_views;
 
 void axr_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+const char *axr_system_name(void);     // what xrGetSystemProperties reports
 
 int64_t axr_now_ns(void);              // XrTime: CLOCK_MONOTONIC nanoseconds
 

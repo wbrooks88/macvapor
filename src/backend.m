@@ -43,6 +43,8 @@ void axr_log(const char *fmt, ...) {
     if (g_logfile) { fputs(line, g_logfile); fflush(g_logfile); }
 }
 
+const char *axr_system_name(void) { return "Apple Vision Pro (ALVR)"; }
+
 int64_t axr_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
