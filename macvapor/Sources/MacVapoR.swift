@@ -1,7 +1,12 @@
 // MacVapoR: installs the alvrxr OpenXR runtime and sets NotProton games up to show on an Apple
-// Vision Pro through ALVR. The work per game is done by the bundled notproton-vr-setup.sh.
+// Vision Pro through ALVR, or on a PlayStation VR2 plugged into the Mac through Sony's PC adapter
+// (the psvr2xr runtime, when the app was built with it; see PSVR2.md). The work per game is done
+// by the bundled notproton-vr-setup.sh; which headset a game shows on is only which runtime the
+// OpenXR loader's active_runtime.json names.
 
 import AppKit
+import CoreGraphics
+import IOKit
 import SwiftUI
 
 enum Paths {
@@ -20,6 +25,11 @@ enum Paths {
     static let runner = home.appending(path: "Library/Application Support/notproton/runners/current")
     static let steam = home.appending(path: "Library/Application Support/Steam")
     static let log = home.appending(path: "Library/Logs/alvrxr.log")
+    static let alvrLib = runtime.appending(path: "libalvrxr.dylib")
+    static let psvr2Lib = runtime.appending(path: "libpsvr2xr.dylib")
+    static let psvr2Selftest = runtime.appending(path: "psvr2xr-selftest")
+    static let psvr2Config = home.appending(path: "Library/Application Support/psvr2xr/config.json")
+    static let psvr2Log = home.appending(path: "Library/Logs/psvr2xr.log")
 
     // Code is in Contents/Library, data in Contents/Resources.
     static let bundledCode = Bundle.main.bundleURL.appending(path: "Contents/Library/MacVapoR")
@@ -31,6 +41,81 @@ struct Headset: Identifiable {
     let id: String
     let name: String
     var trusted: Bool
+}
+
+/// The PS VR2 as macOS sees it: its USB device for tracking and its display for the picture.
+enum PSVR2 {
+    /// The headset's USB device, as the runtime opens it (src/psvr2/cpsvr2.c).
+    static func onUSB() -> Bool {
+        let match = IOServiceMatching("IOUSBHostDevice") as NSMutableDictionary
+        match["idVendor"] = 0x054C
+        match["idProduct"] = 0x0CDE
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, match as CFDictionary)
+        defer { if service != 0 { IOObjectRelease(service) } }
+        return service != 0
+    }
+
+    /// A Sense controller connected over Bluetooth (or USB): 0x0E45 left, 0x0E46 right.
+    static func controllerConnected(left: Bool) -> Bool {
+        let match = IOServiceMatching("IOHIDDevice") as NSMutableDictionary
+        match["VendorID"] = 0x054C
+        match["ProductID"] = left ? 0x0E45 : 0x0E46
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, match as CFDictionary)
+        defer { if service != 0 { IOObjectRelease(service) } }
+        return service != 0
+    }
+
+    enum Display: Equatable { case extended(hz: Double), mirrored, missing }
+
+    /// Found as the runtime finds it (backend_psvr2.m): Sony's EDID vendor id or a 4000-wide mode.
+    static func display() -> Display {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(16, &ids, &count) == .success else { return .missing }
+        var mirrored = false
+        for id in ids.prefix(Int(count)) {
+            let modes = CGDisplayCopyAllDisplayModes(id, nil) as? [CGDisplayMode] ?? []
+            guard CGDisplayVendorNumber(id) == 0x4DD9 || modes.contains(where: { $0.pixelWidth == 4000 }) else { continue }
+            if CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay { mirrored = true; continue }
+            return .extended(hz: CGDisplayCopyDisplayMode(id)?.refreshRate ?? 0)
+        }
+        return mirrored ? .mirrored : .missing
+    }
+
+    /// The runtime's config.json, which backend_psvr2.m reads when a game starts.
+    struct Settings: Equatable {
+        var renderScale = 0.75
+        var eyeHeight = 1.6
+        var lookaheadMs = 0.0
+        var chromatic = true
+        var reprojection = true
+        var positional = false
+        var controllers = true
+
+        static func load() -> Settings {
+            var s = Settings()
+            guard let data = try? Data(contentsOf: Paths.psvr2Config),
+                  let c = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return s }
+            s.renderScale = c["render_scale"] as? Double ?? s.renderScale
+            s.eyeHeight = c["eye_height"] as? Double ?? s.eyeHeight
+            s.lookaheadMs = c["lookahead_ms"] as? Double ?? s.lookaheadMs
+            s.chromatic = c["chromatic"] as? Bool ?? s.chromatic
+            s.reprojection = c["reprojection"] as? Bool ?? s.reprojection
+            s.positional = c["positional"] as? Bool ?? s.positional
+            s.controllers = c["controllers"] as? Bool ?? s.controllers
+            return s
+        }
+
+        func save() {
+            let c: [String: Any] = ["render_scale": renderScale, "eye_height": eyeHeight, "lookahead_ms": lookaheadMs,
+                                    "chromatic": chromatic, "reprojection": reprojection, "positional": positional,
+                                    "controllers": controllers]
+            try? FileManager.default.createDirectory(at: Paths.psvr2Config.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let out = try? JSONSerialization.data(withJSONObject: c, options: [.prettyPrinted, .sortedKeys]) {
+                try? out.write(to: Paths.psvr2Config, options: .atomic)
+            }
+        }
+    }
 }
 
 struct Game: Identifiable {
@@ -49,7 +134,17 @@ struct Game: Identifiable {
 
 @MainActor
 final class Model: ObservableObject {
+    /// Which headset games show on: which runtime active_runtime.json names.
+    enum Target: Equatable { case visionPro, psvr2 }
+
     @Published var installedVersion: String?
+    @Published var target = Model.activeTarget()
+    @Published var psvr2USB = false
+    @Published var psvr2Display = PSVR2.Display.missing
+    @Published var senseLeft = false
+    @Published var senseRight = false
+    @Published var psvr2Settings = PSVR2.Settings.load()
+    @Published var selftest: Process?
     @Published var headsets: [Headset] = []
     /// nil: the real floor (ALVR's LocalFloor); otherwise a fixed eye height in metres (Local).
     @Published var seatedEyeHeight: Double?
@@ -63,10 +158,21 @@ final class Model: ObservableObject {
     let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     var hasRunner: Bool { FileManager.default.fileExists(atPath: Paths.runner.path) }
     var hasOpenComposite: Bool { FileManager.default.fileExists(atPath: Paths.openComposite.path) }
+    /// This copy of the app carries the PS VR2 runtime, and it has been installed.
+    var bundleHasPSVR2: Bool { FileManager.default.fileExists(atPath: Paths.bundledCode.appending(path: "runtime/libpsvr2xr.dylib").path) }
+    var hasPSVR2Runtime: Bool { FileManager.default.fileExists(atPath: Paths.psvr2Lib.path) }
+    private var timer: Timer?
 
     init() {
         refresh()
         checkAudioPermission()
+        // The PS VR2 comes and goes; its status is cheap to read.
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.target == .psvr2 else { return }
+                self.refreshPSVR2()
+            }
+        }
     }
 
     // MARK: game audio
@@ -94,8 +200,17 @@ final class Model: ObservableObject {
 
     func refresh() {
         installedVersion = try? String(contentsOf: Paths.version, encoding: .utf8)
+        target = Self.activeTarget()
         loadHeadsets()
+        refreshPSVR2()
         games = GameScanner.scan()
+    }
+
+    func refreshPSVR2() {
+        psvr2USB = PSVR2.onUSB()
+        psvr2Display = PSVR2.display()
+        senseLeft = PSVR2.controllerConnected(left: true)
+        senseRight = PSVR2.controllerConnected(left: false)
     }
 
     // MARK: runtime
@@ -125,7 +240,7 @@ final class Model: ObservableObject {
                 try fm.createDirectory(at: Paths.session.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.copyItem(at: Paths.bundledData.appending(path: "session-template.json"), to: Paths.session)
             }
-            try writeActiveRuntime()
+            try writeActiveRuntime(hasPSVR2Runtime ? target : .visionPro)
             try bundleVersion.write(to: Paths.version, atomically: true, encoding: .utf8)
             Self.clearQuarantine(Paths.support)
             output = "Runtime \(bundleVersion) installed."
@@ -148,20 +263,26 @@ final class Model: ObservableObject {
         for path in paths { removexattr(path, "com.apple.quarantine", XATTR_NOFOLLOW) }
     }
 
-    private func writeActiveRuntime() throws {
+    static func activeTarget() -> Target {
+        let text = (try? String(contentsOf: Paths.activeRuntime, encoding: .utf8)) ?? ""
+        return text.contains("libpsvr2xr.dylib") ? .psvr2 : .visionPro
+    }
+
+    private func writeActiveRuntime(_ target: Target) throws {
         let fm = FileManager.default
         let dir = Paths.activeRuntime.deletingLastPathComponent()
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         // Another runtime's manifest is kept beside ours rather than lost.
-        if let old = try? String(contentsOf: Paths.activeRuntime, encoding: .utf8), !old.contains("libalvrxr.dylib") {
+        if let old = try? String(contentsOf: Paths.activeRuntime, encoding: .utf8),
+           !old.contains("libalvrxr.dylib"), !old.contains("libpsvr2xr.dylib") {
             try? old.write(to: dir.appending(path: "active_runtime.json.before-macvapor"), atomically: true, encoding: .utf8)
         }
-        let lib = Paths.runtime.appending(path: "libalvrxr.dylib").path
+        let (name, lib) = target == .psvr2 ? ("psvr2xr", Paths.psvr2Lib.path) : ("alvrxr", Paths.alvrLib.path)
         let manifest = """
             {
                 "file_format_version": "1.0.0",
                 "runtime": {
-                    "name": "alvrxr",
+                    "name": "\(name)",
                     "library_path": "\(lib)"
                 }
             }
@@ -169,6 +290,54 @@ final class Model: ObservableObject {
             """
         try manifest.write(to: Paths.activeRuntime, atomically: true, encoding: .utf8)
     }
+
+    /// Points every set-up game at one headset. Games pick it up the next time they start.
+    func setTarget(_ new: Target) {
+        do {
+            try writeActiveRuntime(new)
+            target = new
+            refreshPSVR2()
+            output = new == .psvr2 ? "Games now show on the PS VR2." : "Games now show on the Vision Pro through ALVR."
+        } catch {
+            output = "Could not switch headsets: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: PS VR2
+
+    /// Starts a set-up game through Steam, which runs it with NotProton as its compatibility tool.
+    func play(_ game: Game) {
+        var notes: [String] = []
+        if target == .psvr2 {
+            psvr2Settings.save()
+            refreshPSVR2()
+            if !psvr2USB { notes.append("the PS VR2 is not on USB, so there will be no head tracking") }
+            switch psvr2Display {
+            case .missing: notes.append("no PS VR2 display was found, so nothing will show in the headset")
+            case .mirrored: notes.append("the PS VR2 display mirrors another one; set it to extend the desktop")
+            case .extended: break
+            }
+        }
+        NSWorkspace.shared.open(URL(string: "steam://rungameid/\(game.id)")!)
+        output = "Starting \(game.name) through Steam." + (notes.isEmpty ? "" : " Note: " + notes.joined(separator: "; ") + ".")
+    }
+
+    func startSelftest(slow: Bool) {
+        guard selftest == nil else { return }
+        let p = Process()
+        p.executableURL = Paths.psvr2Selftest
+        p.arguments = slow ? ["--slow", "2"] : []
+        p.terminationHandler = { _ in Task { @MainActor in self.selftest = nil } }
+        do {
+            try p.run()
+            selftest = p
+            output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
+        } catch {
+            output = "Could not start the self-test: \(error.localizedDescription)"
+        }
+    }
+
+    func stopSelftest() { selftest?.terminate() }
 
     // MARK: headsets
 
@@ -233,7 +402,7 @@ final class Model: ObservableObject {
         var env = ProcessInfo.processInfo.environment
         env["GFX"] = "dxmt"
         env["WOX"] = Paths.wineopenxr.path
-        env["ALVRXR_LIB"] = Paths.runtime.appending(path: "libalvrxr.dylib").path
+        env["ALVRXR_LIB"] = Paths.alvrLib.path
         if game.kind == .openVR && !undo {
             guard hasOpenComposite else {
                 output = "\(game.name) uses OpenVR: download OpenComposite first."
@@ -453,8 +622,11 @@ struct ContentView: View {
         .disabled(model.busy)
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
-            Button("Runtime Log", systemImage: "doc.text") { NSWorkspace.shared.open(Paths.log) }
+            Button("Runtime Log", systemImage: "doc.text") {
+                NSWorkspace.shared.open(model.target == .psvr2 ? Paths.psvr2Log : Paths.log)
+            }
         }
+        .onChange(of: model.psvr2Settings) { _, s in s.save() }
     }
 
     private var runtimeSection: some View {
@@ -474,6 +646,9 @@ struct ContentView: View {
                     }
                     Spacer()
                     Button(model.installedVersion == model.bundleVersion ? "Reinstall" : "Install") { model.installRuntime() }
+                }
+                if model.installedVersion != nil {
+                    targetPicker
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -503,7 +678,102 @@ struct ContentView: View {
         }
     }
 
-    private var headsetSection: some View {
+    @ViewBuilder private var targetPicker: some View {
+        HStack {
+            Picker("Show games on", selection: Binding(get: { model.target }, set: { model.setTarget($0) })) {
+                Text("Apple Vision Pro").tag(Model.Target.visionPro)
+                Text("PlayStation VR2").tag(Model.Target.psvr2)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 420)
+            .disabled(!model.hasPSVR2Runtime && model.target == .visionPro)
+        }
+        if !model.hasPSVR2Runtime {
+            Text(model.bundleHasPSVR2 ? "Reinstall to add the PS VR2 runtime." : "This copy of MacVapoR was built without the PS VR2 runtime; see PSVR2.md.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var headsetSection: some View {
+        if model.target == .psvr2 {
+            psvr2Section
+        } else {
+            visionProSection
+        }
+    }
+
+    private var psvr2Section: some View {
+        GroupBox("2. PlayStation VR2") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Plug the headset into Sony's PC adapter, and the adapter into the Mac by DisplayPort and USB. Set its display to extend the desktop at 90 Hz in System Settings > Displays.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                status(model.psvr2USB, "On USB (head tracking)", "Not on USB: check the adapter's USB cable and that the headset is on")
+                switch model.psvr2Display {
+                case .extended(let hz):
+                    status(true, String(format: "Display connected at %.0f Hz%@", hz, hz > 100 ? " (90 Hz is easier on a MacBook)" : ""), "")
+                case .mirrored:
+                    status(false, "", "The PS VR2 display mirrors another one: set it to extend the desktop in Displays")
+                case .missing:
+                    status(false, "", "No PS VR2 display: check the DisplayPort cable and the adapter's power")
+                }
+                if model.psvr2Settings.controllers {
+                    status(model.senseLeft && model.senseRight,
+                           "Both Sense controllers connected",
+                           model.senseLeft || model.senseRight
+                               ? "Only the \(model.senseLeft ? "left" : "right") Sense controller is connected"
+                               : "No Sense controllers: press PS to wake them, or pair them (see below)")
+                    if !(model.senseLeft && model.senseRight) {
+                        Text("To pair one, hold its PS button and Create (left) or Options (right) until its light blinks, then connect it in System Settings > Bluetooth.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Text("Self-test: a test room in the headset, without a game.").foregroundStyle(.secondary)
+                    Spacer()
+                    if model.selftest == nil {
+                        Button("Run") { model.startSelftest(slow: false) }
+                        Button("Run at half rate") { model.startSelftest(slow: true) }
+                    } else {
+                        Button("Stop") { model.stopSelftest() }
+                    }
+                }
+                Divider()
+                HStack {
+                    Text("Render scale")
+                    Slider(value: $model.psvr2Settings.renderScale, in: 0.4...1.2, step: 0.05).frame(maxWidth: 260)
+                    Text(String(format: "%.2f", model.psvr2Settings.renderScale)).monospacedDigit()
+                    Text("lower it if games stutter").font(.caption).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("Eye height")
+                    Slider(value: $model.psvr2Settings.eyeHeight, in: 1.0...2.0, step: 0.05).frame(maxWidth: 260)
+                    Text(String(format: "%.2f m", model.psvr2Settings.eyeHeight)).monospacedDigit()
+                }
+                HStack {
+                    Text("Extra prediction")
+                    Slider(value: $model.psvr2Settings.lookaheadMs, in: -10...20, step: 1).frame(maxWidth: 260)
+                    Text(String(format: "%+.0f ms", model.psvr2Settings.lookaheadMs)).monospacedDigit()
+                }
+                Toggle("Smooth head turns (reprojection)", isOn: $model.psvr2Settings.reprojection)
+                Toggle("Per-colour lens correction", isOn: $model.psvr2Settings.chromatic)
+                Toggle("Room-scale position (experimental)", isOn: $model.psvr2Settings.positional)
+                Toggle("Sense controllers", isOn: $model.psvr2Settings.controllers)
+                Text("Takes effect the next time a game starts. The headset's Fn button recenters the view and the controllers; a controller's PS button points it forward again.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(4)
+        }
+    }
+
+    private func status(_ ok: Bool, _ good: String, _ bad: String) -> some View {
+        Label(ok ? good : bad, systemImage: ok ? "checkmark.circle" : "exclamationmark.triangle")
+            .foregroundStyle(ok ? Color.secondary : Color.orange)
+    }
+
+    private var visionProSection: some View {
         GroupBox("2. Headsets") {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Open ALVR on the Vision Pro while a set-up game is running, and it shows up here. Trust it, then restart the game.")
@@ -545,7 +815,9 @@ struct ContentView: View {
     private var gamesSection: some View {
         GroupBox("3. Games") {
             VStack(alignment: .leading, spacing: 10) {
-                Text("In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then open ALVR on the Vision Pro with the controllers awake, and launch the game.")
+                Text(model.target == .psvr2
+                     ? "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then put the headset on, wake the Sense controllers, and press Play. The controllers turn but don't track position, so games where you reach for things work less well."
+                     : "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then open ALVR on the Vision Pro with the controllers awake, and press Play.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -614,6 +886,10 @@ struct GameRow: View {
             }
             Button(game.configured ? "Set Up Again" : "Set Up") { model.setUp(game, exe: exe, undo: false) }
                 .disabled(game.prefix == nil || exe.isEmpty || model.installedVersion == nil)
+            if game.configured {
+                Button("Play") { model.play(game) }
+                    .buttonStyle(.borderedProminent)
+            }
         }
         .onAppear { if exe.isEmpty { exe = game.exes.first ?? "" } }
         Divider()
