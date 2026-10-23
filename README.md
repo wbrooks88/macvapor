@@ -10,7 +10,8 @@ PS VR2 Sense controller and button input back. No PC and no SteamVR.
 
 **PlayStation VR2:** this fork also has a backend that shows games on a PS VR2 plugged into the
 Mac through Sony's PC adapter, with no Vision Pro. The MacVapoR app picks which headset games
-show on and starts set-up games with a Play button. It is new and untested; see [PSVR2.md](PSVR2.md).
+show on and starts set-up games with a Play button. The Sense controllers connect to the Mac over
+Bluetooth; they turn but don't track position yet. It is new and untested; see [PSVR2.md](PSVR2.md).
 
 Game audio streams to the headset with the video. OpenXR games (Beat Saber) run directly; OpenVR (SteamVR) games such as The Lab run through
 [OpenComposite](https://gitlab.com/znixian/OpenOVR), which MacVapoR downloads for you.

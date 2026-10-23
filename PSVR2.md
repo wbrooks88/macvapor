@@ -15,9 +15,14 @@ What works in this first stage:
   since it was rendered, so turning your head stays smooth when the game runs below the panel's
   rate. That matters on a MacBook Air.
 - Recentering with the headset's Fn button.
+- The Sense controllers over Bluetooth: buttons, sticks, triggers, finger sensors, vibration, and
+  orientation from each controller's own motion sensor. Games see them as Quest Touch controllers.
 
-Not yet: the Sense controllers. Play games that work with a gamepad, which Wine passes to the
-game by itself. Room-scale position is experimental (see `positional` below).
+Not yet: the controllers' position. Tracking where they are needs the headset's cameras to watch
+their light rings, and no open code does that on a Mac yet. Until then each hand is placed by an
+arm model: an elbow at your side and a forearm that turns with the controller. Pointing, aiming,
+turning a wheel and pressing buttons work; reaching out to grab things only partly does. Room-scale
+position for the head is experimental (see `positional` below).
 
 The headset code (USB protocol, lens correction, head tracking) comes from
 [psvr2-player-mac](https://github.com/ttkalec/psvr2-player-mac), which ports it from Monado's
@@ -41,6 +46,16 @@ driver; see `src/psvr2/`.
 2. Turn the headset on. A display called "PS VR2" should appear in System Settings > Displays.
 3. Set it to **extend** the desktop (not mirror), at **90 Hz**, and pick **2000x1020** or
    **4000x2040**.
+
+## Pair the controllers
+
+Once per controller: hold its PS button and Create (left) or Options (right) until its light
+blinks, then pick it under System Settings > Bluetooth. After that, pressing PS wakes it and it
+reconnects.
+
+When a game starts, each controller points where your head faces, so hold them pointing forward.
+Press a controller's PS button to point it forward again whenever it drifts; the headset's Fn
+button recenters your view and both controllers at once.
 
 ## Build
 
@@ -78,6 +93,10 @@ away: red ahead, green right, blue behind, yellow left. Check:
   correction is off.
 - Turning your head moves the view the right way, and the pillars stay where they are.
 - Fn recenters you to face the red pillar.
+- With the controllers on, a cyan ball (left) and a magenta ball (right) sit near your hands, with a
+  small white one 20 cm ahead of each. Point a controller around: the white ball should follow
+  where it points. Pull a trigger: its ball lights up and the controller buzzes. If a controller
+  points the wrong way after you press its PS button, send me the log.
 - Both eyes fuse into one 3D picture. If it looks doubled or uncomfortable, close it right away
   and send me the log.
 
@@ -106,13 +125,15 @@ run, and read when a game starts:
 | `reprojection` | true | Turns each frame with your head. Turn it off only to compare. |
 | `chromatic` | true | Per-colour lens correction. |
 | `lookahead_ms` | 0 | Adds to the head prediction. Raise it if the world seems to lag your head when you turn. |
+| `controllers` | true | Use the Sense controllers over Bluetooth. |
 | `positional` | false | Experimental: use the headset's own position tracking instead of the neck model. The axes are a guess; if moving your head moves the world the wrong way, turn it back off and send me the log. |
 
 ## Logs
 
 `~/Library/Logs/psvr2xr.log` gets a line every 5 seconds: the game's frame rate, how many frames
 the panel composed and repeated, whether the head is tracked, the IPD dial, and raw tracking
-numbers. Send it along with what you saw.
+numbers. Each connected controller gets a line too (battery, buttons, stick, trigger, where it
+points), and its calibration is logged when it connects. Send it along with what you saw.
 
 ## How it works
 
@@ -122,3 +143,9 @@ display composes the newest game frame at the panel's rate (`src/psvr2_compose.m
 runtime reports the field of view the lens correction expects, so the game renders exactly the
 area the lenses show. Each submitted frame is copied off the game's swapchain on the game's own
 queue, so the compositor can show it again on refreshes the game misses.
+
+`src/sense.c` talks to the Sense controllers through macOS's HID manager. Reading their
+calibration switches them into full reporting; their reports and vibration commands follow
+Monado's PlayStation Sense driver and PSVR2Toolkit. Orientation is fused from each controller's
+gyro and accelerometer, which holds pitch and roll steady; yaw drifts slowly, which the PS button
+fixes.

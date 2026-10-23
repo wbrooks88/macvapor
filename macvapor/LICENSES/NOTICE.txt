@@ -26,3 +26,7 @@ The PS VR2 backend (libpsvr2xr.dylib and psvr2xr-selftest, in the app's runtime 
   includes src/psvr2/ from https://github.com/ttkalec/psvr2-player-mac (MIT), which ports the
   PS VR2 protocol, lens distortion and its table from Monado's psvr2 driver (BSL-1.0).
   See src/psvr2/LICENSE and src/psvr2/THIRD-PARTY.md.
+  Its Sense controller support (src/sense.c) follows the report layouts, CRCs and calibration of
+  Monado's pssense driver (BSL-1.0, Copyright 2023 Collabora, Ltd. and Jarett Millard) and
+  PSVR2Toolkit (https://github.com/BnuuySolutions/PSVR2Toolkit, MIT, Copyright 2026 Bnuuy
+  Solutions).

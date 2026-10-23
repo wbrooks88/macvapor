@@ -8,7 +8,9 @@
 // the head has rotated since the game rendered it, so head turns stay smooth when the game runs
 // slower than the panel. Head rotation comes over USB (src/psvr2/, from psvr2-player-mac and
 // Monado's driver). Position is a neck model unless config.json asks for the experimental SLAM
-// position; there are no controllers yet.
+// position. The Sense controllers come over Bluetooth (sense.c): their buttons, sticks, triggers
+// and orientation, placed by an arm model, since their position needs camera tracking that no open
+// code does on a Mac yet.
 
 #import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -23,6 +25,7 @@
 
 #include "alvrxr.h"
 #include "psvr2/cpsvr2.h"
+#include "sense.h"
 
 unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // runtime.m's frame and input counts
 unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
@@ -80,10 +83,12 @@ typedef struct {
     bool chromatic;       // per-colour lens correction
     bool reprojection;    // turn each frame by the head's rotation since it was rendered
     bool positional;      // experimental: the headset's SLAM position instead of the neck model
+    bool controllers;     // the Sense controllers over Bluetooth
 } config;
 
 static NSString *g_config_dir;
-static config g_cfg = {.render_scale = 0.75f, .eye_height = 1.6f, .chromatic = true, .reprojection = true};
+static config g_cfg = {.render_scale = 0.75f, .eye_height = 1.6f, .chromatic = true, .reprojection = true,
+                       .controllers = true};
 
 static void read_config(void) {
     NSString *path = [g_config_dir stringByAppendingPathComponent:@"config.json"];
@@ -94,6 +99,7 @@ static void read_config(void) {
             @"render_scale" : @(g_cfg.render_scale), @"eye_height" : @(g_cfg.eye_height),
             @"lookahead_ms" : @(g_cfg.lookahead_ms), @"chromatic" : @(g_cfg.chromatic),
             @"reprojection" : @(g_cfg.reprojection), @"positional" : @(g_cfg.positional),
+            @"controllers" : @(g_cfg.controllers),
         };
         [[NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
             writeToFile:path atomically:YES];
@@ -107,9 +113,12 @@ static void read_config(void) {
     if (c[@"chromatic"]) g_cfg.chromatic = [c[@"chromatic"] boolValue];
     if (c[@"reprojection"]) g_cfg.reprojection = [c[@"reprojection"] boolValue];
     if (c[@"positional"]) g_cfg.positional = [c[@"positional"] boolValue];
-    axr_log("config: render scale %.2f, eye height %.2f m, lookahead %+.1f ms, chromatic %s, reprojection %s, %s",
+    if (c[@"controllers"]) g_cfg.controllers = [c[@"controllers"] boolValue];
+    axr_log("config: render scale %.2f, eye height %.2f m, lookahead %+.1f ms, chromatic %s, reprojection %s, %s,"
+            " controllers %s",
             g_cfg.render_scale, g_cfg.eye_height, g_cfg.lookahead_ms, g_cfg.chromatic ? "on" : "off",
-            g_cfg.reprojection ? "on" : "off", g_cfg.positional ? "SLAM position (experimental)" : "neck model");
+            g_cfg.reprojection ? "on" : "off", g_cfg.positional ? "SLAM position (experimental)" : "neck model",
+            g_cfg.controllers ? "on" : "off");
 }
 
 // --------------------------------------------------------------------------------- quaternions
@@ -246,6 +255,41 @@ static bool slam_position(float out[3]) {
     return true;
 }
 
+// ------------------------------------------------------------------------------- controllers
+//
+// A controller's orientation comes from its own IMU, level with gravity but with a yaw that is
+// wherever it started and drifts slowly; g_ctl_yaw turns it to match the room. It is set when a
+// controller connects, when the headset recenters, and when the controller's PS button is pressed,
+// each time taking the controller to be pointing the way the head faces.
+
+static quat g_ctl_yaw[2] = {{0, 0, 0, 1}, {0, 0, 0, 1}};
+static bool g_ctl_aligned[2];
+static float g_torso_yaw;          // the arm model's shoulders, which follow the head's yaw loosely
+
+static float yaw_of(quat q) {
+    float f[3] = {0, 0, -1}, fwd[3];
+    qrot(q, f, fwd);
+    return atan2f(-fwd[0], -fwd[2]);
+}
+
+// The grip's orientation in the room, before g_ctl_yaw.
+static quat raw_grip(const sense_state *s) {
+    quat imu = {s->orientation[0], s->orientation[1], s->orientation[2], s->orientation[3]};
+    quat to_grip = {sense_imu_to_grip[0], sense_imu_to_grip[1], sense_imu_to_grip[2], sense_imu_to_grip[3]};
+    return qnorm(qmul(imu, to_grip));
+}
+
+// Turns a controller to point where the head faces, head_yaw radians from -Z.
+static void align_controller(int hand, float head_yaw) {
+    sense_state s;
+    if (!sense_get(hand, &s)) return;
+    float yaw = yaw_of(raw_grip(&s));
+    pthread_mutex_lock(&g_lock);
+    g_ctl_yaw[hand] = qyaw(head_yaw - yaw);
+    g_ctl_aligned[hand] = true;
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void recenter(void) {
     quat o;
     float q[4];
@@ -264,6 +308,7 @@ static void recenter(void) {
         pthread_mutex_unlock(&g_lock);
     }
     axr_log("recentered (turned %.0f deg)", yaw * 180 / M_PI);
+    for (int h = 0; h < 2; h++) align_controller(h, 0);
 }
 
 // The orientation a frame for display time t is rendered with: the one predicted for it at
@@ -300,9 +345,57 @@ static axr_pose head_pose(quat q) {
     return p;
 }
 
-axr_motion axr_device_motion(int device, int64_t time) {
+// Where a hand is: an elbow hanging below the shoulder on its side, and a forearm along the
+// controller. The shoulders turn with the head only once it looks more than 35 degrees away, so
+// looking around doesn't swing the arms.
+static axr_motion hand_motion(int hand, int64_t time) {
     axr_motion m = {0};
-    if (device != AXR_HEAD) return m;   // no controllers yet
+    sense_state s;
+    if (!g_cfg.controllers || !sense_get(hand, &s) || !s.updated_ns) return m;
+    pthread_mutex_lock(&g_lock);
+    quat align = g_ctl_yaw[hand];
+    bool aligned = g_ctl_aligned[hand];
+    pthread_mutex_unlock(&g_lock);
+    if (!aligned) return m;
+    quat head = pose_for(time);
+    axr_pose hp = head_pose(head);
+    float head_yaw = yaw_of(head);
+    pthread_mutex_lock(&g_lock);
+    float d = remainderf(head_yaw - g_torso_yaw, 2 * (float)M_PI);
+    if (fabsf(d) > 35 * (float)M_PI / 180) g_torso_yaw += d - copysignf(35 * (float)M_PI / 180, d);
+    quat torso = qyaw(g_torso_yaw);
+    pthread_mutex_unlock(&g_lock);
+
+    quat grip = qnorm(qmul(align, raw_grip(&s)));
+    float side = hand == SENSE_LEFT ? -1 : 1;
+    // The elbow 18 cm out to the side of and 52 cm below the eyes (a shoulder 22 cm below them,
+    // an upper arm of 30 cm hanging down), then 32 cm of forearm and hand along the controller.
+    float neck[3] = {hp.position[0], hp.position[1], hp.position[2]};
+    float elbow_off[3] = {side * 0.18f, -0.52f, 0.02f}, elbow[3], fore[3] = {0, 0, -0.32f}, hand_off[3];
+    qrot(torso, elbow_off, elbow);
+    qrot(grip, fore, hand_off);
+    for (int i = 0; i < 3; i++) {
+        elbow[i] += neck[i];
+        m.pose.position[i] = elbow[i] + hand_off[i];
+    }
+    m.pose.orientation[0] = grip.x; m.pose.orientation[1] = grip.y;
+    m.pose.orientation[2] = grip.z; m.pose.orientation[3] = grip.w;
+    float w[3];
+    qrot(align, s.angular_velocity, w);
+    memcpy(m.angular_velocity, w, sizeof w);
+    // The hand moves with the forearm's turn about the elbow.
+    m.linear_velocity[0] = w[1] * hand_off[2] - w[2] * hand_off[1];
+    m.linear_velocity[1] = w[2] * hand_off[0] - w[0] * hand_off[2];
+    m.linear_velocity[2] = w[0] * hand_off[1] - w[1] * hand_off[0];
+    m.valid = true;
+    return m;
+}
+
+axr_motion axr_device_motion(int device, int64_t time) {
+    if (device == AXR_LEFT) return hand_motion(SENSE_LEFT, time);
+    if (device == AXR_RIGHT) return hand_motion(SENSE_RIGHT, time);
+    axr_motion m = {0};
+    if (device != AXR_HEAD) return m;
     quat q = pose_for(time);
     m.pose = head_pose(q);
     float gyro[3];
@@ -329,11 +422,54 @@ axr_views axr_current_views(void) {
 
 // ------------------------------------------------------------------------------------- input
 
-// Stage 1 has no controllers; games are played with a gamepad, which Wine passes through itself.
-bool axr_input(const char *path, float *value) { (void)path; (void)value; return false; }
-uint64_t axr_input_generation(void) { return 0; }
+// runtime.m binds games to the Quest Touch profile and asks for its OpenXR input paths, as ALVR
+// names them. The Sense controllers map onto it by position: square/cross are X/A, triangle/circle
+// Y/B, L1/R1 the grip, create/options the menu button.
+bool axr_input(const char *path, float *value) {
+    int hand;
+    const char *rest;
+    if (!strncmp(path, "/user/hand/left/input/", 22)) hand = SENSE_LEFT, rest = path + 22;
+    else if (!strncmp(path, "/user/hand/right/input/", 23)) hand = SENSE_RIGHT, rest = path + 23;
+    else return false;
+    sense_state s;
+    if (!g_cfg.controllers || !sense_get(hand, &s)) return false;
+    uint32_t b = s.buttons;
+    bool left = hand == SENSE_LEFT;
+    float stick[2] = {s.stick[0], s.stick[1]};
+    float r = hypotf(stick[0], stick[1]);   // a small round dead zone, rescaled to reach 1
+    float k = r < 0.08f ? 0 : fminf(1, (r - 0.08f) / 0.92f) / r;
+    stick[0] *= k;
+    stick[1] *= k;
+#define IS(x) (!strcmp(rest, x))
+#define BIT(m) ((b & (m)) ? 1.0f : 0.0f)
+    float v;
+    if (IS(left ? "x/click" : "a/click")) v = BIT(SENSE_FACE_LOWER);
+    else if (IS(left ? "x/touch" : "a/touch")) v = BIT(SENSE_FACE_LOWER_TOUCH);
+    else if (IS(left ? "y/click" : "b/click")) v = BIT(SENSE_FACE_UPPER);
+    else if (IS(left ? "y/touch" : "b/touch")) v = BIT(SENSE_FACE_UPPER_TOUCH);
+    else if (IS("menu/click") || IS("system/click")) v = BIT(SENSE_MENU);
+    else if (IS("squeeze/value") || IS("squeeze/click")) v = BIT(SENSE_GRIP);
+    else if (IS("squeeze/touch")) v = BIT(SENSE_GRIP | SENSE_GRIP_TOUCH);
+    else if (IS("trigger/value")) v = s.trigger;
+    else if (IS("trigger/click")) v = s.trigger > 0.75f ? 1 : 0;
+    else if (IS("trigger/touch")) v = (b & SENSE_TRIGGER_TOUCH) || s.trigger > 0.02f ? 1 : 0;
+    else if (IS("thumbstick/x")) v = stick[0];
+    else if (IS("thumbstick/y")) v = stick[1];
+    else if (IS("thumbstick/click")) v = BIT(SENSE_STICK_CLICK);
+    else if (IS("thumbstick/touch")) v = BIT(SENSE_STICK_TOUCH | SENSE_STICK_CLICK);
+    else return false;
+#undef IS
+#undef BIT
+    *value = v;
+    return true;
+}
+
+uint64_t axr_input_generation(void) { return sense_generation(); }
+
 void axr_haptics(int hand, float duration_s, float frequency, float amplitude) {
-    (void)hand; (void)duration_s; (void)frequency; (void)amplitude;
+    if (!g_cfg.controllers) return;
+    if (hand == AXR_LEFT) sense_vibrate(SENSE_LEFT, duration_s, frequency, amplitude);
+    if (hand == AXR_RIGHT) sense_vibrate(SENSE_RIGHT, duration_s, frequency, amplitude);
 }
 
 // ------------------------------------------------------------------------------ frame timing
@@ -609,7 +745,7 @@ static void on_main(void (^block)(void)) {
 
 static void *status_thread(void *arg) {
     (void)arg;
-    bool was_down = false, recentered = false;
+    bool was_down = false, recentered = false, ps_down[2] = {false, false};
     int64_t connected_since = 0, last_stats = axr_now_ns();
     for (;;) {
         struct timespec d = {0, 50000000};
@@ -629,6 +765,24 @@ static void *status_thread(void *arg) {
             bool down = psvr2_get_button() == 1;
             if (down && !was_down) recenter();
             was_down = down;
+        }
+        // A controller that has just connected, or whose PS button was pressed, points where the
+        // head faces.
+        for (int h = 0; h < 2 && g_cfg.controllers; h++) {
+            sense_state s;
+            bool on = sense_get(h, &s) && s.updated_ns;
+            quat head = QID;
+            head_orientation(0, &head);
+            pthread_mutex_lock(&g_lock);
+            bool aligned = g_ctl_aligned[h];
+            if (!on) g_ctl_aligned[h] = false;
+            pthread_mutex_unlock(&g_lock);
+            bool ps = on && (s.buttons & SENSE_PS);
+            if (on && (!aligned || (ps && !ps_down[h]))) {
+                align_controller(h, yaw_of(head));
+                if (aligned) axr_log("%s controller recentered", h == SENSE_LEFT ? "left" : "right");
+            }
+            ps_down[h] = ps;
         }
         if (now - last_stats > 5000000000LL) {
             double dt = (now - last_stats) / 1e9;
@@ -653,6 +807,17 @@ static void *status_thread(void *arg) {
                         submits / dt, dropped, refresh, composed / dt, repeated, no_drawable, axr_stat_wait,
                         axr_stat_end, axr_stat_projection, axr_backend_connected() ? "tracking" : "NOT tracking",
                         prox, ipd, bias, corr, p[0], p[1], p[2]);
+            for (int h = 0; h < 2 && g_cfg.controllers; h++) {
+                sense_state s;
+                if (!sense_get(h, &s)) continue;
+                float e[3] = {0}, f[3] = {0, 0, -1};
+                qrot(raw_grip(&s), f, e);
+                axr_log("%s controller: %s, battery %.0f%%%s, buttons %03x, stick (%.2f, %.2f), trigger %.2f,"
+                        " pointing (%.2f, %.2f, %.2f) before recentering, %s",
+                        h == SENSE_LEFT ? "left" : "right", s.bluetooth ? "Bluetooth" : "USB", s.battery * 100,
+                        s.charging ? " charging" : "", s.buttons, s.stick[0], s.stick[1], s.trigger, e[0], e[1], e[2],
+                        s.updated_ns && axr_now_ns() - (int64_t)s.updated_ns < 1000000000 ? "reporting" : "NOT reporting");
+            }
             axr_stat_wait = axr_stat_end = axr_stat_projection = 0;
             axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
         }
@@ -729,6 +894,8 @@ void axr_backend_start(void) {
             axr_log("no display link for the headset display; nothing will be shown");
         }
     }
+
+    if (g_cfg.controllers) sense_start();
 
     pthread_t t;
     pthread_create(&t, NULL, status_thread, NULL);

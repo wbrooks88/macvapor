@@ -55,6 +55,16 @@ enum PSVR2 {
         return service != 0
     }
 
+    /// A Sense controller connected over Bluetooth (or USB): 0x0E45 left, 0x0E46 right.
+    static func controllerConnected(left: Bool) -> Bool {
+        let match = IOServiceMatching("IOHIDDevice") as NSMutableDictionary
+        match["VendorID"] = 0x054C
+        match["ProductID"] = left ? 0x0E45 : 0x0E46
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, match as CFDictionary)
+        defer { if service != 0 { IOObjectRelease(service) } }
+        return service != 0
+    }
+
     enum Display: Equatable { case extended(hz: Double), mirrored, missing }
 
     /// Found as the runtime finds it (backend_psvr2.m): Sony's EDID vendor id or a 4000-wide mode.
@@ -80,6 +90,7 @@ enum PSVR2 {
         var chromatic = true
         var reprojection = true
         var positional = false
+        var controllers = true
 
         static func load() -> Settings {
             var s = Settings()
@@ -91,12 +102,14 @@ enum PSVR2 {
             s.chromatic = c["chromatic"] as? Bool ?? s.chromatic
             s.reprojection = c["reprojection"] as? Bool ?? s.reprojection
             s.positional = c["positional"] as? Bool ?? s.positional
+            s.controllers = c["controllers"] as? Bool ?? s.controllers
             return s
         }
 
         func save() {
             let c: [String: Any] = ["render_scale": renderScale, "eye_height": eyeHeight, "lookahead_ms": lookaheadMs,
-                                    "chromatic": chromatic, "reprojection": reprojection, "positional": positional]
+                                    "chromatic": chromatic, "reprojection": reprojection, "positional": positional,
+                                    "controllers": controllers]
             try? FileManager.default.createDirectory(at: Paths.psvr2Config.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let out = try? JSONSerialization.data(withJSONObject: c, options: [.prettyPrinted, .sortedKeys]) {
                 try? out.write(to: Paths.psvr2Config, options: .atomic)
@@ -128,6 +141,8 @@ final class Model: ObservableObject {
     @Published var target = Model.activeTarget()
     @Published var psvr2USB = false
     @Published var psvr2Display = PSVR2.Display.missing
+    @Published var senseLeft = false
+    @Published var senseRight = false
     @Published var psvr2Settings = PSVR2.Settings.load()
     @Published var selftest: Process?
     @Published var headsets: [Headset] = []
@@ -194,6 +209,8 @@ final class Model: ObservableObject {
     func refreshPSVR2() {
         psvr2USB = PSVR2.onUSB()
         psvr2Display = PSVR2.display()
+        senseLeft = PSVR2.controllerConnected(left: true)
+        senseRight = PSVR2.controllerConnected(left: false)
     }
 
     // MARK: runtime
@@ -701,6 +718,17 @@ struct ContentView: View {
                 case .missing:
                     status(false, "", "No PS VR2 display: check the DisplayPort cable and the adapter's power")
                 }
+                if model.psvr2Settings.controllers {
+                    status(model.senseLeft && model.senseRight,
+                           "Both Sense controllers connected",
+                           model.senseLeft || model.senseRight
+                               ? "Only the \(model.senseLeft ? "left" : "right") Sense controller is connected"
+                               : "No Sense controllers: press PS to wake them, or pair them (see below)")
+                    if !(model.senseLeft && model.senseRight) {
+                        Text("To pair one, hold its PS button and Create (left) or Options (right) until its light blinks, then connect it in System Settings > Bluetooth.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 HStack {
                     Text("Self-test: a test room in the headset, without a game.").foregroundStyle(.secondary)
                     Spacer()
@@ -731,7 +759,8 @@ struct ContentView: View {
                 Toggle("Smooth head turns (reprojection)", isOn: $model.psvr2Settings.reprojection)
                 Toggle("Per-colour lens correction", isOn: $model.psvr2Settings.chromatic)
                 Toggle("Room-scale position (experimental)", isOn: $model.psvr2Settings.positional)
-                Text("Takes effect the next time a game starts. The headset's Fn button recenters the view.")
+                Toggle("Sense controllers", isOn: $model.psvr2Settings.controllers)
+                Text("Takes effect the next time a game starts. The headset's Fn button recenters the view and the controllers; a controller's PS button points it forward again.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -787,7 +816,7 @@ struct ContentView: View {
         GroupBox("3. Games") {
             VStack(alignment: .leading, spacing: 10) {
                 Text(model.target == .psvr2
-                     ? "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then put the headset on and press Play. There are no motion controllers on the PS VR2 yet, so use a gamepad."
+                     ? "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then put the headset on, wake the Sense controllers, and press Play. The controllers turn but don't track position, so games where you reach for things work less well."
                      : "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then open ALVR on the Vision Pro with the controllers awake, and press Play.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
