@@ -42,8 +42,9 @@ cflags="-mmacosx-version-min=$MIN_VER -O2 -g -Wall -Wno-unused-function -Wno-dep
 for f in cpsvr2 fusion lut; do
     clang $cflags -I "$BREW/include/libusb-1.0" -c "$here/src/psvr2/$f.c" -o "$here/build/$f.o"
 done
-core="$here/build/cpsvr2.o $here/build/fusion.o $here/build/lut.o"
-frameworks="-framework Foundation -framework AppKit -framework Metal -framework QuartzCore -framework CoreVideo -framework CoreGraphics"
+clang $cflags -c "$here/src/sense.c" -o "$here/build/sense.o"   # the Sense controllers
+core="$here/build/cpsvr2.o $here/build/fusion.o $here/build/lut.o $here/build/sense.o"
+frameworks="-framework Foundation -framework AppKit -framework Metal -framework QuartzCore -framework CoreVideo -framework CoreGraphics -framework IOKit"
 
 # shellcheck disable=SC2086
 clang -dynamiclib $cflags -fobjc-arc -fvisibility=hidden \

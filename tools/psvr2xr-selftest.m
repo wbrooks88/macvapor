@@ -10,6 +10,11 @@
 // The room: a floor grid with 1 m squares, a horizon, and four pillars 3 m away: red ahead,
 // green to the right, blue behind and yellow to the left. Straight grid lines and a level horizon
 // mean the lens correction is right; pillars that stay put when you turn mean tracking is.
+//
+// Sense controllers, when connected over Bluetooth, show as a ball at each hand (cyan left,
+// magenta right) with a smaller one 20 cm along where the controller points; the trigger lights the
+// ball up and vibrates the controller. Each points where your head faces when it connects; press
+// its PS button to point it forward again.
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #include <pthread.h>
@@ -29,7 +34,7 @@ static const char *scene_source =
     "    o.uv = float2(p[vid].x * 0.5 + 0.5, 1.0 - (p[vid].y * 0.5 + 0.5));\n"
     "    return o;\n"
     "}\n"
-    "struct Eye { float4x4 rot; float4 origin; float4 tans; };\n"   // tans: tan of left, right, up, down
+    "struct Eye { float4x4 rot; float4 origin; float4 tans; float4 hand[2]; float4 tip[2]; };\n"   // tans: tan of left, right, up, down; hand/tip w: shown, trigger
     "static float pillar(float3 o, float3 d, float2 c, float r) {\n"   // distance along d to a vertical cylinder
     "    float2 oc = o.xz - c; float2 dd = d.xz;\n"
     "    float a = dot(dd, dd), b = dot(oc, dd), k = dot(oc, oc) - r * r;\n"
@@ -38,6 +43,12 @@ static const char *scene_source =
     "    float t = (-b - sqrt(h)) / a;\n"
     "    float y = o.y + t * d.y;\n"
     "    return (t > 0.0 && y > 0.0 && y < 2.5) ? t : -1.0;\n"
+    "}\n"
+    "static float ball(float3 o, float3 d, float3 c, float r) {\n"   // distance along d to a sphere
+    "    float3 oc = o - c; float b = dot(oc, d), k = dot(oc, oc) - r * r, h = b * b - k;\n"
+    "    if (h < 0.0) return -1.0;\n"
+    "    float t = -b - sqrt(h);\n"
+    "    return t > 0.0 ? t : -1.0;\n"
     "}\n"
     "fragment float4 fs(VOut in [[stage_in]], constant Eye &e [[buffer(0)]]) {\n"
     "    float tx = mix(e.tans.x, e.tans.y, in.uv.x);\n"
@@ -64,6 +75,15 @@ static const char *scene_source =
     "            best = t;\n"
     "        }\n"
     "    }\n"
+    "    float3 hc[2] = { float3(0.1, 0.85, 0.95), float3(0.95, 0.2, 0.85) };\n"
+    "    for (int i = 0; i < 2; i++) {\n"
+    "        if (e.hand[i].w == 0.0) continue;\n"
+    "        float glow = 0.35 + 0.65 * e.tip[i].w;\n"
+    "        float t = ball(o, d, e.hand[i].xyz, 0.04);\n"
+    "        if (t > 0.0 && t < best) { best = t; col = hc[i] * glow * (0.6 + 0.4 * saturate(dot(normalize(o + t * d - e.hand[i].xyz), float3(0.4, 0.6, 0.7)))); }\n"
+    "        t = ball(o, d, e.tip[i].xyz, 0.015);\n"
+    "        if (t > 0.0 && t < best) { best = t; col = float3(1.0); }\n"
+    "    }\n"
     "    return float4(col, 1.0);\n"
     "}\n";
 
@@ -71,6 +91,8 @@ typedef struct {
     float rot[16];
     float origin[4];
     float tans[4];
+    float hand[2][4];   // position, shown
+    float tip[2][4];    // 20 cm along the controller, trigger
 } eye_uniform;
 
 static int g_slow = 1;
@@ -108,6 +130,22 @@ static void *render_thread(void *arg) {
             for (int skip = 1; skip < g_slow; skip++) t = axr_wait_frame();
             axr_motion head = axr_device_motion(AXR_HEAD, t);
             axr_views v = axr_current_views();
+            float hands[2][4] = {{0}}, tips[2][4] = {{0}};
+            for (int k = 0; k < 2; k++) {
+                axr_motion m = axr_device_motion(k == 0 ? AXR_LEFT : AXR_RIGHT, t);
+                if (!m.valid) continue;
+                float trig = 0, rot[16], along[3];
+                axr_input(k == 0 ? "/user/hand/left/input/trigger/value" : "/user/hand/right/input/trigger/value", &trig);
+                if (trig > 0.1f) axr_haptics(k == 0 ? AXR_LEFT : AXR_RIGHT, 0.05f, 160, trig);
+                matrix_from(m.pose.orientation, rot);
+                for (int j = 0; j < 3; j++) along[j] = -rot[8 + j] * 0.2f;   // -Z column
+                for (int j = 0; j < 3; j++) {
+                    hands[k][j] = m.pose.position[j];
+                    tips[k][j] = m.pose.position[j] + along[j];
+                }
+                hands[k][3] = 1;
+                tips[k][3] = trig;
+            }
             int i = frame++ % 3;
             id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
             for (int e = 0; e < 2; e++) {
@@ -119,6 +157,8 @@ static void *render_thread(void *arg) {
                     u.origin[k] = head.pose.position[k] + u.rot[k] * off[0] + u.rot[4 + k] * off[1] + u.rot[8 + k] * off[2];
                 u.origin[3] = 1;
                 for (int k = 0; k < 4; k++) u.tans[k] = tanf(v.fov[e][k]);
+                memcpy(u.hand, hands, sizeof hands);
+                memcpy(u.tip, tips, sizeof tips);
                 MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
                 pass.colorAttachments[0].texture = tex[i][e];
                 pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -159,7 +199,9 @@ int main(int argc, char **argv) {
 
         printf("Put the headset on. You should stand in a grey room with a floor grid and four pillars:\n"
                "red ahead, green right, blue behind, yellow left. Press the headset's Fn button to face\n"
-               "the red pillar again. Status every 5 s here and in ~/Library/Logs/psvr2xr.log.\n"
+               "the red pillar again. Sense controllers show as cyan (left) and magenta (right) balls; pull\n"
+               "a trigger to light one and feel it buzz, press PS to point it forward again.\n"
+               "Status every 5 s here and in ~/Library/Logs/psvr2xr.log.\n"
                "Quit with Ctrl-C.\n");
         pthread_t t;
         pthread_create(&t, NULL, render_thread, NULL);
