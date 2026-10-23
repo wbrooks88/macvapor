@@ -46,7 +46,22 @@ driver; see `src/psvr2/`.
 
     ./build-psvr2.sh
 
-This makes `out/libpsvr2xr.dylib` (the runtime) and `out/psvr2xr-selftest`.
+This makes `out/libpsvr2xr.dylib` (the runtime), `out/psvr2xr-selftest`, and
+`out/PS VR2 Launcher.app`, which carries a copy of both. You can drag the app to Applications.
+
+## The launcher app
+
+`open "out/PS VR2 Launcher.app"` shows everything in one window:
+
+1. **Headset**: whether the headset is on USB and its display is extended, and at what rate; which
+   runtime games will load (PS VR2 or Vision Pro), with buttons to switch; and the self-test
+   (Run, Run at half rate, Stop).
+2. **Steam VR games**: the VR games in your Steam libraries. Games MacVapoR has set up get a
+   **Play** button, which switches games to the PS VR2 and starts the game through Steam, so it
+   runs with NotProton as usual. Others say to set them up in MacVapoR first.
+3. **Settings**: sliders and switches for the settings below, saved when you press Play.
+
+The steps below do the same things from Terminal.
 
 ## Step 1: the self-test
 
@@ -70,7 +85,7 @@ Then try `out/psvr2xr-selftest --slow 2`, which renders only every other frame, 
     tools/psvr2-runtime.sh on
 
 Games set up by MacVapoR now load the PS VR2 runtime. Launch one from NotProton with the headset
-on. `tools/psvr2-runtime.sh off` switches back to the Vision Pro runtime.
+on (or press Play in the launcher, which does both steps). `tools/psvr2-runtime.sh off` switches back to the Vision Pro runtime.
 
 Start with a light, seated game that works with a gamepad. Games that need motion controllers
 will load but can't be played yet.

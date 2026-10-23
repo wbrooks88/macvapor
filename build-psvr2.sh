@@ -2,6 +2,8 @@
 # Builds the PS VR2 variant of the runtime and its self-test into out/ (see PSVR2.md):
 #   out/libpsvr2xr.dylib, out/psvr2xr.json   the OpenXR runtime, runtime.m on backend_psvr2.m
 #   out/psvr2xr-selftest                      the backend alone, showing a test room
+#   out/PS VR2 Launcher.app                   headset status, runtime switch, Steam VR games with
+#                                             Play buttons, settings; carries a copy of both above
 # No ALVR is needed. Needs the Command Line Tools and Homebrew's libusb and vulkan-headers, and
 # the OpenXR headers: OPENXR points at a clone of KhronosGroup/OpenXR-SDK (include/) or a built
 # OpenXR-SDK-Source (build/include/).
@@ -65,5 +67,32 @@ cat > "$out/psvr2xr.json" <<JSON
     }
 }
 JSON
-echo "built $out/libpsvr2xr.dylib and $out/psvr2xr-selftest"
-echo "try the headset: $out/psvr2xr-selftest; then switch games to it: tools/psvr2-runtime.sh on"
+# The launcher app, with the runtime and the self-test inside it so it can be moved anywhere.
+app="$out/PS VR2 Launcher.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Library/psvr2xr"
+swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_VER" \
+    "$here/psvr2-launcher/PSVR2Launcher.swift" -o "$app/Contents/MacOS/PS VR2 Launcher"
+cp "$out/libpsvr2xr.dylib" "$out/psvr2xr-selftest" "$app/Contents/Library/psvr2xr/"
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>PS VR2 Launcher</string>
+    <key>CFBundleDisplayName</key><string>PS VR2 Launcher</string>
+    <key>CFBundleExecutable</key><string>PS VR2 Launcher</string>
+    <key>CFBundleIdentifier</key><string>org.macvapor.psvr2-launcher</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>$MIN_VER</string>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+codesign -f -s - "$app/Contents/Library/psvr2xr/libpsvr2xr.dylib" "$app/Contents/Library/psvr2xr/psvr2xr-selftest" 2>/dev/null
+codesign -f -s - "$app" 2>/dev/null
+
+echo "built $out/libpsvr2xr.dylib, $out/psvr2xr-selftest and $app"
+echo "open the launcher: open \"$app\" (or drag it to Applications first)"
