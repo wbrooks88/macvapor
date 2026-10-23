@@ -89,6 +89,19 @@ swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_VER" "$here/macvapor/
     -o "$app/Contents/MacOS/MacVapoR"
 cp "$out/libpsvr2xr.dylib" "$out/psvr2xr-selftest" "$app/Contents/Library/MacVapoR/runtime/"
 cp "$here/src/psvr2/LICENSE" "$app/Contents/Resources/LICENSES/psvr2-player-mac-MIT.txt"
+# neutron support (games through the free neutron Steam Play tool instead of NotProton): the
+# wineopenxr-neutron kit, its prebuilt Windows half and the sources of its Mac half, with this
+# tree's setup script. NEUTRON_KIT picks the unpacked kit; without one the app is NotProton-only.
+kit=${NEUTRON_KIT:-$here/wineopenxr-neutron}
+if [ -f "$kit/x86_64-windows/wineopenxr.dll" ]; then
+    rm -rf "$app/Contents/Resources/wineopenxr-neutron"
+    mkdir -p "$app/Contents/Resources/wineopenxr-neutron"
+    cp -R "$kit/x86_64-windows" "$kit/src" "$kit/include" "$kit/wineopenxr64.json" "$app/Contents/Resources/wineopenxr-neutron/"
+    cp "$here/tools/neutron-vr-setup.sh" "$app/Contents/Resources/wineopenxr-neutron/"
+    echo "added neutron support from $kit"
+else
+    echo "no wineopenxr-neutron kit at $kit, so this app is NotProton-only (set NEUTRON_KIT)" >&2
+fi
 codesign -f -s - "$app/Contents/Library/MacVapoR/runtime/libpsvr2xr.dylib" "$app/Contents/Library/MacVapoR/runtime/psvr2xr-selftest"
 codesign -f -s - "$app"
 echo "built $app: drag it to Applications in place of the old one, open it, press Reinstall, then"

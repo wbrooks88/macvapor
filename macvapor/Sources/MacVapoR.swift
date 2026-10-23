@@ -1,8 +1,9 @@
-// MacVapoR: installs the alvrxr OpenXR runtime and sets NotProton games up to show on an Apple
-// Vision Pro through ALVR, or on a PlayStation VR2 plugged into the Mac through Sony's PC adapter
-// (the psvr2xr runtime, when the app was built with it; see PSVR2.md). The work per game is done
-// by the bundled notproton-vr-setup.sh; which headset a game shows on is only which runtime the
-// OpenXR loader's active_runtime.json names.
+// MacVapoR: installs the alvrxr OpenXR runtime and sets NotProton or neutron games up to show on
+// an Apple Vision Pro through ALVR, or on a PlayStation VR2 plugged into the Mac through Sony's PC
+// adapter (the psvr2xr runtime, when the app was built with it; see PSVR2.md). The work per game
+// is done by the bundled notproton-vr-setup.sh, or neutron-vr-setup.sh when neutron (the free
+// Steam Play tool) is installed; which headset a game shows on is only which runtime the OpenXR
+// loader's active_runtime.json names.
 
 import AppKit
 import CoreGraphics
@@ -23,6 +24,10 @@ enum Paths {
     static let height = home.appending(path: "Library/Application Support/alvrxr/height.json")
     static let activeRuntime = home.appending(path: ".config/openxr/1/active_runtime.json")
     static let runner = home.appending(path: "Library/Application Support/notproton/runners/current")
+    static let neutron = home.appending(path: "Library/Application Support/neutron/compatibilitytools.d/neutron_proton/files")
+    /// wineopenxr for neutron, with the script that sets games up and builds its Mac half here.
+    static let neutronKit = support.appending(path: "wineopenxr-neutron")
+    static let neutronScript = neutronKit.appending(path: "neutron-vr-setup.sh")
     static let steam = home.appending(path: "Library/Application Support/Steam")
     static let log = home.appending(path: "Library/Logs/alvrxr.log")
     static let alvrLib = runtime.appending(path: "libalvrxr.dylib")
@@ -157,6 +162,11 @@ final class Model: ObservableObject {
 
     let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     var hasRunner: Bool { FileManager.default.fileExists(atPath: Paths.runner.path) }
+    /// neutron is installed; games are then set up for it rather than for NotProton.
+    var hasNeutron: Bool { FileManager.default.fileExists(atPath: Paths.neutron.appending(path: "bin/wine").path) }
+    var bundleHasNeutronKit: Bool { FileManager.default.fileExists(atPath: Paths.bundledData.appending(path: "wineopenxr-neutron").path) }
+    /// The Steam Play tool games run with, as the instructions name it.
+    var toolName: String { hasNeutron ? "neutron" : "NotProton" }
     var hasOpenComposite: Bool { FileManager.default.fileExists(atPath: Paths.openComposite.path) }
     /// This copy of the app carries the PS VR2 runtime, and it has been installed.
     var bundleHasPSVR2: Bool { FileManager.default.fileExists(atPath: Paths.bundledCode.appending(path: "runtime/libpsvr2xr.dylib").path) }
@@ -233,6 +243,11 @@ final class Model: ObservableObject {
                             to: Paths.wineopenxr.appending(path: "aarch64-unix"))
             try? fm.removeItem(at: Paths.script)
             try fm.copyItem(at: Paths.bundledData.appending(path: "notproton-vr-setup.sh"), to: Paths.script)
+            // neutron's kit is data: its script builds wineopenxr's Mac half beside it on first use.
+            try? fm.removeItem(at: Paths.neutronKit)
+            if bundleHasNeutronKit {
+                try fm.copyItem(at: Paths.bundledData.appending(path: "wineopenxr-neutron"), to: Paths.neutronKit)
+            }
             try? fm.removeItem(at: Paths.audioHelper)
             try fm.copyItem(at: Paths.bundledAudioHelper, to: Paths.audioHelper)
 
@@ -403,6 +418,14 @@ final class Model: ObservableObject {
         env["GFX"] = "dxmt"
         env["WOX"] = Paths.wineopenxr.path
         env["ALVRXR_LIB"] = Paths.alvrLib.path
+        env["TARGET"] = target == .psvr2 ? "psvr2" : "alvr"
+        // The Command Line Tools' clang, which neutron-vr-setup.sh builds with, and Homebrew's bin.
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+        let neutron = hasNeutron
+        if neutron && !FileManager.default.fileExists(atPath: Paths.neutronScript.path) {
+            output = bundleHasNeutronKit ? "Press Reinstall above to add neutron support." : "This copy of MacVapoR was built without neutron support; see PSVR2.md."
+            return
+        }
         if game.kind == .openVR && !undo {
             guard hasOpenComposite else {
                 output = "\(game.name) uses OpenVR: download OpenComposite first."
@@ -410,14 +433,14 @@ final class Model: ObservableObject {
             }
             env["OC"] = Paths.openComposite.path
         }
-        var args = [Paths.script.path]
+        var args = [neutron ? Paths.neutronScript.path : Paths.script.path]
         if undo { args.append("--undo") }
         args += [game.id, exe]
         busy = true
-        output = ""
+        output = neutron ? "Setting up \(game.name) for neutron (the first time builds a small part, which takes a few seconds)…" : ""
         Task.detached {
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
             p.arguments = args
             p.environment = env
             let pipe = Pipe()
@@ -587,8 +610,10 @@ enum GameScanner {
                 let prefixes = [apps.appending(path: "compatdata/\(id)/pfx"),
                                 Paths.steam.appending(path: "steamapps/compatdata/\(id)/pfx")]
                 let prefix = prefixes.first { fm.fileExists(atPath: $0.appending(path: "system.reg").path) }
+                // NotProton's setup stages wineopenxr for Steam; neutron's only puts it in system32.
                 let configured = prefix.map {
                     fm.fileExists(atPath: $0.appending(path: "drive_c/Program Files (x86)/Steam/aarch64-windows/wineopenxr.dll").path)
+                        || fm.fileExists(atPath: $0.appending(path: "drive_c/windows/system32/wineopenxr64.json").path)
                 } ?? false
                 games.append(Game(id: id, name: name, dir: dir, prefix: prefix, exes: exes, kind: kind,
                                   configured: configured, graphics: graphics(in: options[id])))
@@ -632,8 +657,10 @@ struct ContentView: View {
     private var runtimeSection: some View {
         GroupBox("1. Runtime") {
             VStack(alignment: .leading, spacing: 8) {
-                if !model.hasRunner {
-                    Label("NotProton's CrossOver runner was not found. Install NotProton and run a game with it once.",
+                if model.hasNeutron {
+                    Label("Games run with neutron.", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+                } else if !model.hasRunner {
+                    Label("No Steam Play tool found. Install neutron (free, see PSVR2.md) or NotProton, and run a game with it once.",
                           systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                 }
@@ -812,12 +839,20 @@ struct ContentView: View {
         }
     }
 
+    private var gamesHelp: String {
+        let before = model.hasNeutron
+            ? "Close the game before setting it up."
+            : "In NotProton, set the game's graphics to DXMT. Close the game before setting it up."
+        let after = model.target == .psvr2
+            ? "Then put the headset on, wake the Sense controllers, and press Play. The controllers turn but don't track position, so games where you reach for things work less well."
+            : "Then open ALVR on the Vision Pro with the controllers awake, and press Play."
+        return before + " " + after
+    }
+
     private var gamesSection: some View {
         GroupBox("3. Games") {
             VStack(alignment: .leading, spacing: 10) {
-                Text(model.target == .psvr2
-                     ? "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then put the headset on, wake the Sense controllers, and press Play. The controllers turn but don't track position, so games where you reach for things work less well."
-                     : "In NotProton, set the game's graphics to DXMT. Close the game before setting it up. Then open ALVR on the Vision Pro with the controllers awake, and press Play.")
+                Text(verbatim: gamesHelp)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -860,7 +895,7 @@ struct GameRow: View {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                     }
                 }
-                if game.kind != .other {
+                if game.kind != .other && !model.hasNeutron {   // neutron's D3D11 is always DXMT
                     if game.graphics?.lowercased() == "dxmt" {
                         Label("DXMT", systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
                     } else {
@@ -871,7 +906,7 @@ struct GameRow: View {
                     }
                 }
                 if game.prefix == nil {
-                    Text("Launch it once with NotProton first.").font(.caption).foregroundStyle(.secondary)
+                    Text("Launch it once with \(model.toolName) first.").font(.caption).foregroundStyle(.secondary)
                 } else if !game.exes.isEmpty {
                     Picker("Executable", selection: $exe) {
                         ForEach(game.exes, id: \.self) { Text($0).tag($0) }

@@ -28,6 +28,21 @@ The headset code (USB protocol, lens correction, head tracking) comes from
 [psvr2-player-mac](https://github.com/ttkalec/psvr2-player-mac), which ports it from Monado's
 driver; see `src/psvr2/`.
 
+## The quick way: neutron and the installer
+
+No CrossOver is needed. [neutron](https://github.com/lixsldotnet/neutron) is a free Steam Play tool
+(arm64 Wine with FEX and DXMT) that runs 64-bit Windows games from Mac Steam, and MacVapoR sets
+its games up when it is installed. `tools/install-psvr2.command`, in a folder with this branch as
+`macvapor.bundle` and the `wineopenxr-neutron` kit, installs everything else and builds the app:
+with Steam logged in once and [Homebrew](https://brew.sh) installed, double-click it (right-click >
+Open the first time). Then in MacVapoR press Install, pick PlayStation VR2, and per game: start it
+once from Steam, quit, press Set Up, then Play. 32-bit games don't run under neutron.
+
+The kit holds wineopenxr built for neutron's Wine 11.19 (its Windows half) and the sources and
+headers of its Mac half, which `tools/neutron-vr-setup.sh` builds against neutron's own ntdll.so
+the first time a game is set up. `build-psvr2.sh` bundles it when `NEUTRON_KIT` (or
+`./wineopenxr-neutron`) has it.
+
 ## What you need
 
 - An Apple silicon Mac with macOS 15 or later.
