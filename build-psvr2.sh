@@ -2,8 +2,8 @@
 # Builds the PS VR2 variant of the runtime and its self-test into out/ (see PSVR2.md):
 #   out/libpsvr2xr.dylib, out/psvr2xr.json   the OpenXR runtime, runtime.m on backend_psvr2.m
 #   out/psvr2xr-selftest                      the backend alone, showing a test room
-#   out/PS VR2 Launcher.app                   headset status, runtime switch, Steam VR games with
-#                                             Play buttons, settings; carries a copy of both above
+#   out/MacVapoR.app                          MacVapoR with the PS VR2 in it, made from the one in
+#                                             /Applications (see the end); NO_APP=1 skips it
 # No ALVR is needed. Needs the Command Line Tools and Homebrew's libusb and vulkan-headers, and
 # the OpenXR headers: OPENXR points at a clone of KhronosGroup/OpenXR-SDK (include/) or a built
 # OpenXR-SDK-Source (build/include/).
@@ -67,32 +67,28 @@ cat > "$out/psvr2xr.json" <<JSON
     }
 }
 JSON
-# The launcher app, with the runtime and the self-test inside it so it can be moved anywhere.
-app="$out/PS VR2 Launcher.app"
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Library/psvr2xr"
-swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_VER" \
-    "$here/psvr2-launcher/PSVR2Launcher.swift" -o "$app/Contents/MacOS/PS VR2 Launcher"
-cp "$out/libpsvr2xr.dylib" "$out/psvr2xr-selftest" "$app/Contents/Library/psvr2xr/"
-cat > "$app/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key><string>PS VR2 Launcher</string>
-    <key>CFBundleDisplayName</key><string>PS VR2 Launcher</string>
-    <key>CFBundleExecutable</key><string>PS VR2 Launcher</string>
-    <key>CFBundleIdentifier</key><string>org.macvapor.psvr2-launcher</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1</string>
-    <key>CFBundleVersion</key><string>1</string>
-    <key>LSMinimumSystemVersion</key><string>$MIN_VER</string>
-    <key>NSHighResolutionCapable</key><true/>
-</dict>
-</plist>
-PLIST
-codesign -f -s - "$app/Contents/Library/psvr2xr/libpsvr2xr.dylib" "$app/Contents/Library/psvr2xr/psvr2xr-selftest" 2>/dev/null
-codesign -f -s - "$app" 2>/dev/null
+echo "built $out/libpsvr2xr.dylib and $out/psvr2xr-selftest"
+[ -n "${NO_APP:-}" ] && exit 0
 
-echo "built $out/libpsvr2xr.dylib, $out/psvr2xr-selftest and $app"
-echo "open the launcher: open \"$app\" (or drag it to Applications first)"
+# MacVapoR.app with the PS VR2 in it. It is made from a MacVapoR.app you already have (from a
+# release DMG, or from macvapor/make-release.sh), so ALVR and NotProton need not be built here:
+# the app itself is rebuilt from macvapor/Sources, and the PS VR2 runtime and self-test are added
+# beside alvrxr. MACVAPOR_APP picks the app to start from.
+base=${MACVAPOR_APP:-/Applications/MacVapoR.app}
+if [ ! -x "$base/Contents/MacOS/MacVapoR" ]; then
+    echo "no MacVapoR.app at $base, so only the runtime was built. Install MacVapoR from its release DMG" >&2
+    echo "(or set MACVAPOR_APP) and run this again to get MacVapoR.app with the PS VR2 in it." >&2
+    exit 0
+fi
+app="$out/MacVapoR.app"
+rm -rf "$app"
+ditto "$base" "$app"
+xattr -dr com.apple.quarantine "$app" 2>/dev/null || true
+swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_VER" "$here/macvapor/Sources/MacVapoR.swift" \
+    -o "$app/Contents/MacOS/MacVapoR"
+cp "$out/libpsvr2xr.dylib" "$out/psvr2xr-selftest" "$app/Contents/Library/MacVapoR/runtime/"
+cp "$here/src/psvr2/LICENSE" "$app/Contents/Resources/LICENSES/psvr2-player-mac-MIT.txt"
+codesign -f -s - "$app/Contents/Library/MacVapoR/runtime/libpsvr2xr.dylib" "$app/Contents/Library/MacVapoR/runtime/psvr2xr-selftest"
+codesign -f -s - "$app"
+echo "built $app: drag it to Applications in place of the old one, open it, press Reinstall, then"
+echo "choose PlayStation VR2 under Show games on"
