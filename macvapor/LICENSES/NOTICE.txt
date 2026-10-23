@@ -22,7 +22,7 @@ wineopenxr (wineopenxr.dll, wineopenxr.so), from Valve's Proton at commit
 OpenComposite is not included. MacVapoR downloads it on request from its official builds,
 https://gitlab.com/znixian/OpenOVR (GPL-3.0).
 
-The PS VR2 backend (libpsvr2xr.dylib, built by build-psvr2.sh; not part of the MacVapoR app)
+The PS VR2 backend (libpsvr2xr.dylib and psvr2xr-selftest, in the app's runtime folder)
   includes src/psvr2/ from https://github.com/ttkalec/psvr2-player-mac (MIT), which ports the
   PS VR2 protocol, lens distortion and its table from Monado's psvr2 driver (BSL-1.0).
   See src/psvr2/LICENSE and src/psvr2/THIRD-PARTY.md.

@@ -32,6 +32,8 @@ app=$dist/MacVapoR.app
 
 if [ -z "${SKIP_BUILD:-}" ]; then
     MIN_VER=$MIN_VER "$repo/build.sh"
+    # The PS VR2 runtime (see PSVR2.md), installed beside alvrxr.
+    NO_APP=1 OPENXR=$OPENXR MIN_VER=$MIN_VER "$repo/build-psvr2.sh"
     "$NOTPROTON/wineopenxr/build.sh"
 fi
 wox=$NOTPROTON/build/wineopenxr-out
@@ -53,12 +55,14 @@ sed "s/@VERSION@/$VERSION/g" "$repo/helper/Info.plist" > "$helper/Contents/Info.
 cp "$here/MacVapoR.icns" "$helper/Contents/Resources/"
 sed "s/@VERSION@/$VERSION/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 cp "$repo/out/libalvrxr.dylib" "$repo/out/libalvr_server_core.dylib" "$code/runtime/"
+cp "$repo/out/libpsvr2xr.dylib" "$repo/out/psvr2xr-selftest" "$code/runtime/"
 cp "$wox/aarch64-unix/wineopenxr.so" "$wox/aarch64-unix/libopenxr_loader.dylib" "$code/wineopenxr/aarch64-unix/"
 cp "$wox/x86_64-windows/wineopenxr.dll" "$data/wineopenxr/x86_64-windows/"
 cp "$wox/wineopenxr64.json" "$data/wineopenxr/"
 cp "$repo/tools/notproton-vr-setup.sh" "$here/session-template.json" "$here/MacVapoR.icns" "$data/"
 cp "$here/LICENSES/"* "$data/LICENSES/"
 cp "$repo/LICENSE" "$data/LICENSES/MacVapoR-MIT.txt"
+cp "$repo/src/psvr2/LICENSE" "$data/LICENSES/psvr2-player-mac-MIT.txt"
 cp "$ALVR/LICENSE" "$data/LICENSES/ALVR-MIT.txt"
 cp "$OPENXR/LICENSES/Apache-2.0.txt" "$data/LICENSES/OpenXR-loader-Apache-2.0.txt"
 cp "$NOTPROTON/wineopenxr/crossover.patch" "$data/LICENSES/wineopenxr-crossover.patch"
