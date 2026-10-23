@@ -40,6 +40,9 @@ enum Paths {
     static let bundledCode = Bundle.main.bundleURL.appending(path: "Contents/Library/MacVapoR")
     static let bundledData = Bundle.main.resourceURL!
     static let bundledAudioHelper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/MacVapoR Audio.app")
+    /// Installs neutron, or hooks it back into Steam; with the node its Steam helper runs on.
+    static let bundledNeutronInstaller = bundledData.appending(path: "install-neutron.sh")
+    static let bundledNode = bundledData.appending(path: "node/bin")
 }
 
 struct Headset: Identifiable {
@@ -167,6 +170,17 @@ final class Model: ObservableObject {
     var bundleHasNeutronKit: Bool { FileManager.default.fileExists(atPath: Paths.bundledData.appending(path: "wineopenxr-neutron").path) }
     /// The Steam Play tool games run with, as the instructions name it.
     var toolName: String { hasNeutron ? "neutron" : "NotProton" }
+    /// neutron's start script is Steam.app's executable; a Steam update undoes that.
+    var steamHooked: Bool {
+        let plist = URL(fileURLWithPath: "/Applications/Steam.app/Contents/Info.plist")
+        guard let d = NSDictionary(contentsOf: plist) else { return false }
+        return d["CFBundleExecutable"] as? String == "steam_neutron"
+    }
+    var canInstallNeutron: Bool { FileManager.default.fileExists(atPath: Paths.bundledNeutronInstaller.path) }
+    /// Everything for neutron and the PS VR2 is in place: what the Install Everything button checks.
+    var everythingInstalled: Bool {
+        installedVersion == bundleVersion && hasNeutron && steamHooked && (!bundleHasPSVR2 || hasPSVR2Runtime)
+    }
     var hasOpenComposite: Bool { FileManager.default.fileExists(atPath: Paths.openComposite.path) }
     /// This copy of the app carries the PS VR2 runtime, and it has been installed.
     var bundleHasPSVR2: Bool { FileManager.default.fileExists(atPath: Paths.bundledCode.appending(path: "runtime/libpsvr2xr.dylib").path) }
@@ -266,6 +280,49 @@ final class Model: ObservableObject {
         refresh()
     }
 
+    /// The one button for a new Mac: the runtime, the PS VR2 as the headset when this app has it,
+    /// and neutron with its Steam hook (whose installer quits and restarts Steam).
+    func installEverything() {
+        installRuntime()
+        if hasPSVR2Runtime { setTarget(.psvr2) }
+        guard canInstallNeutron, !hasNeutron || !steamHooked else {
+            refresh()
+            return
+        }
+        var env = ProcessInfo.processInfo.environment
+        if FileManager.default.fileExists(atPath: Paths.bundledNode.appending(path: "node").path) {
+            env["NODE_DIR"] = Paths.bundledNode.path
+        }
+        busy = true
+        output = "Installing neutron: downloading about 260 MB, then Steam quits and starts again. This takes a few minutes…"
+        Task.detached {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = [Paths.bundledNeutronInstaller.path]
+            p.environment = env
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = pipe
+            var text: String
+            do {
+                try p.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                // neutron's installer colours its lines; the output box shows plain text.
+                text = String(decoding: data, as: UTF8.self)
+                    .replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+                if p.terminationStatus != 0 { text += "\n(neutron install failed, status \(p.terminationStatus))" }
+            } catch {
+                text = "Could not run the neutron installer: \(error.localizedDescription)"
+            }
+            await MainActor.run {
+                self.output = text
+                self.busy = false
+                self.refresh()
+            }
+        }
+    }
+
     /// Copies out of an app that came from a download keep its quarantine flag, and the setup
     /// script's cp carries it into every game's prefix. These files are part of the notarized
     /// app, so they are installed as trusted, the way an installer would.
@@ -319,6 +376,22 @@ final class Model: ObservableObject {
     }
 
     // MARK: PS VR2
+
+    /// With neutron, Play does the setup too: a game not started yet is started once so neutron
+    /// makes its prefix, and one with a prefix is set up first and then started.
+    func playOrSetUp(_ game: Game, exe: String) {
+        if game.configured || game.prefix == nil || exe.isEmpty {
+            play(game)
+            if game.prefix == nil {
+                output = "Starting \(game.name) once so neutron can prepare it. Quit it, then press Play again for VR."
+            }
+            return
+        }
+        setUp(game, exe: exe, undo: false) { [weak self] in
+            guard let self, let set = self.games.first(where: { $0.id == game.id }) else { return }
+            self.play(set)
+        }
+    }
 
     /// Starts a set-up game through Steam, which runs it with NotProton as its compatibility tool.
     func play(_ game: Game) {
@@ -413,7 +486,8 @@ final class Model: ObservableObject {
 
     // MARK: games
 
-    func setUp(_ game: Game, exe: String, undo: Bool) {
+    /// Runs the setup script for one game; `then` runs once it has succeeded.
+    func setUp(_ game: Game, exe: String, undo: Bool, then: (@MainActor () -> Void)? = nil) {
         var env = ProcessInfo.processInfo.environment
         env["GFX"] = "dxmt"
         env["WOX"] = Paths.wineopenxr.path
@@ -447,19 +521,22 @@ final class Model: ObservableObject {
             p.standardOutput = pipe
             p.standardError = pipe
             let text: String
+            var ok = false
             do {
                 try p.run()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 p.waitUntilExit()
-                let status = p.terminationStatus == 0 ? "" : "\n(failed, status \(p.terminationStatus))"
+                ok = p.terminationStatus == 0
+                let status = ok ? "" : "\n(failed, status \(p.terminationStatus))"
                 text = String(decoding: data, as: UTF8.self) + status
             } catch {
                 text = "Could not run the setup script: \(error.localizedDescription)"
             }
-            await MainActor.run {
+            await MainActor.run { [ok] in
                 self.output = text
                 self.busy = false
                 self.refresh()
+                if ok { then?() }
             }
         }
     }
@@ -657,6 +734,15 @@ struct ContentView: View {
     private var runtimeSection: some View {
         GroupBox("1. Runtime") {
             VStack(alignment: .leading, spacing: 8) {
+                if model.canInstallNeutron && !model.everythingInstalled {
+                    HStack {
+                        Text("New here? This installs the runtime and neutron (the free tool Steam runs Windows games with), and picks the PS VR2. Steam must be installed and logged in; it restarts once.")
+                            .font(.callout)
+                        Spacer()
+                        Button("Install Everything") { model.installEverything() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
                 if model.hasNeutron {
                     Label("Games run with neutron.", systemImage: "checkmark.circle").foregroundStyle(.secondary)
                 } else if !model.hasRunner {
@@ -921,7 +1007,10 @@ struct GameRow: View {
             }
             Button(game.configured ? "Set Up Again" : "Set Up") { model.setUp(game, exe: exe, undo: false) }
                 .disabled(game.prefix == nil || exe.isEmpty || model.installedVersion == nil)
-            if game.configured {
+            if model.hasNeutron && model.installedVersion != nil {
+                Button("Play") { model.playOrSetUp(game, exe: exe) }
+                    .buttonStyle(.borderedProminent)
+            } else if game.configured {
                 Button("Play") { model.play(game) }
                     .buttonStyle(.borderedProminent)
             }

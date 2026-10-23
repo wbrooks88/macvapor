@@ -60,7 +60,8 @@ build() {
     # The arm64 OpenXR loader that ships with MacVapoR's wineopenxr.
     if [ -z "${LOADER:-}" ]; then
         for l in "$MACVAPOR/wineopenxr/aarch64-unix/libopenxr_loader.dylib" \
-                 /Applications/MacVapoR.app/Contents/Library/MacVapoR/wineopenxr/aarch64-unix/libopenxr_loader.dylib; do
+                 /Applications/MacVapoR.app/Contents/Library/MacVapoR/wineopenxr/aarch64-unix/libopenxr_loader.dylib \
+                 "$out/libopenxr_loader.dylib"; do
             [ -f "$l" ] && { LOADER=$l; break; }
         done
     fi
@@ -88,13 +89,14 @@ build() {
     rm -rf "$tmp"
     [ -f "$out/wineopenxr.so" ] || die "link failed"
     nm -u "$out/wineopenxr.so" | grep -qE "_xrGetInstanceProcAddr$" || die "wineopenxr.so does not import the OpenXR loader"
-    cp -f "$LOADER" "$out/libopenxr_loader.dylib"
+    [ "$LOADER" -ef "$out/libopenxr_loader.dylib" ] || cp -f "$LOADER" "$out/libopenxr_loader.dylib"
     codesign -s - -f "$out/wineopenxr.so" >/dev/null 2>&1 || true
     echo "built $out/wineopenxr.so"
 }
 
 if [ "${1:-}" = "--build" ]; then
     build
+    shasum -a 256 "$wine_unix/ntdll.so" | cut -d' ' -f1 > "$out/ntdll.sha256"
     exit 0
 fi
 
@@ -161,10 +163,13 @@ fi
 
 [ -f "$runtime_lib" ] || die "no $runtime_lib; open MacVapoR and install its runtime first"
 
-# Build, or rebuild when neutron's ntdll.so changed (a neutron update).
-stamp="$out/ntdll-stamp"
-now=$(stat -f '%m %z' "$wine_unix/ntdll.so")
-if [ ! -f "$out/wineopenxr.so" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$now" ]; then
+# A prebuilt Mac half (make-psvr2-dmg.sh puts one in the app) is kept while it was linked against
+# this very ntdll.so; otherwise, or after a neutron update, it is built here.
+stamp="$out/ntdll.sha256"
+now=$(shasum -a 256 "$wine_unix/ntdll.so" | cut -d' ' -f1)
+if [ ! -f "$out/wineopenxr.so" ] || [ ! -f "$out/libopenxr_loader.dylib" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$now" ]; then
+    [ -w "$kit" ] || die "neutron changed since this MacVapoR was made; reinstall MacVapoR's runtime (Install Everything)"
+    command -v clang >/dev/null || die "neutron is a different version from the one this MacVapoR was made for; install the Command Line Tools (xcode-select --install) so it can adapt, then set the game up again"
     build
     printf '%s' "$now" > "$stamp"
 fi

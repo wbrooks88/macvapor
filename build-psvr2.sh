@@ -97,10 +97,20 @@ if [ -f "$kit/x86_64-windows/wineopenxr.dll" ]; then
     rm -rf "$app/Contents/Resources/wineopenxr-neutron"
     mkdir -p "$app/Contents/Resources/wineopenxr-neutron"
     cp -R "$kit/x86_64-windows" "$kit/src" "$kit/include" "$kit/wineopenxr64.json" "$app/Contents/Resources/wineopenxr-neutron/"
+    # The Mac half prebuilt against one neutron's ntdll.so (make-psvr2-dmg.sh), when there is one.
+    [ -f "$kit/aarch64-unix/wineopenxr.so" ] && cp -R "$kit/aarch64-unix" "$app/Contents/Resources/wineopenxr-neutron/"
     cp "$here/tools/neutron-vr-setup.sh" "$app/Contents/Resources/wineopenxr-neutron/"
+    cp "$here/tools/install-neutron.sh" "$app/Contents/Resources/"
     echo "added neutron support from $kit"
 else
     echo "no wineopenxr-neutron kit at $kit, so this app is NotProton-only (set NEUTRON_KIT)" >&2
+fi
+# A node for neutron's Steam helper, so the app needs no Homebrew: NODE_DIST is an unpacked
+# nodejs.org darwin-arm64 release (make-psvr2-dmg.sh fetches one). Only its bin/node is needed.
+if [ -n "${NODE_DIST:-}" ] && [ -x "$NODE_DIST/bin/node" ]; then
+    mkdir -p "$app/Contents/Resources/node/bin"
+    cp "$NODE_DIST/bin/node" "$app/Contents/Resources/node/bin/"
+    cp "$NODE_DIST/LICENSE" "$app/Contents/Resources/LICENSES/node-LICENSE.txt"
 fi
 codesign -f -s - "$app/Contents/Library/MacVapoR/runtime/libpsvr2xr.dylib" "$app/Contents/Library/MacVapoR/runtime/psvr2xr-selftest"
 codesign -f -s - "$app"
