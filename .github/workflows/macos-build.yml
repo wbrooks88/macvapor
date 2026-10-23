@@ -1,0 +1,58 @@
+# Builds the PS VR2 runtime, its self-test and the MacVapoR app on a GitHub macOS runner, so build
+# errors show up here rather than on the Mac it is tested on. Nothing is signed or released.
+name: macOS build
+
+on:
+  push:
+    branches: [psvr2-backend]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          brew install libusb vulkan-headers
+          git clone --depth 1 https://github.com/KhronosGroup/OpenXR-SDK "$RUNNER_TEMP/OpenXR-SDK"
+
+      - name: PS VR2 runtime and self-test
+        run: NO_APP=1 OPENXR="$RUNNER_TEMP/OpenXR-SDK" ./build-psvr2.sh
+
+      - name: MacVapoR app
+        run: |
+          mkdir -p out/app
+          swiftc -O -parse-as-library -target arm64-apple-macos15.0 macvapor/Sources/MacVapoR.swift -o out/app/MacVapoR
+
+      - name: Shaders
+        # Both shaders are compiled from source at run time; compile them here too, if the runner
+        # has a Metal device.
+        run: |
+          out/psvr2xr-selftest --shaders-only
+          cat > "$RUNNER_TEMP/metal-check.m" <<'OBJC'
+          #import <Foundation/Foundation.h>
+          #import <Metal/Metal.h>
+          int main(int argc, char **argv) {
+              id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+              if (!dev) { puts("no Metal device on this runner; shader not checked"); return 0; }
+              NSString *src = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:nil];
+              NSError *err = nil;
+              id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
+              if (!lib) { fprintf(stderr, "%s\n", err.localizedDescription.UTF8String); return 1; }
+              printf("%s compiles\n", argv[1]);
+              return 0;
+          }
+          OBJC
+          clang -fobjc-arc "$RUNNER_TEMP/metal-check.m" -framework Foundation -framework Metal -o "$RUNNER_TEMP/metal-check"
+          "$RUNNER_TEMP/metal-check" src/psvr2_compose.metal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: psvr2xr-macos
+          path: |
+            out/libpsvr2xr.dylib
+            out/psvr2xr-selftest
+            out/psvr2xr.json

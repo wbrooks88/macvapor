@@ -6,6 +6,7 @@
 //   out/psvr2xr-selftest            render every frame
 //   out/psvr2xr-selftest --slow N   render only every Nth frame, as a slow game would; with
 //                                   reprojection on, turning your head should still look smooth
+//   out/psvr2xr-selftest --shaders-only   compile the test room's shader and exit (for CI)
 //
 // The room: a floor grid with 1 m squares, a horizon, and four pillars 3 m away: red ahead,
 // green to the right, blue behind and yellow to the left. Straight grid lines and a level horizon
@@ -96,6 +97,7 @@ typedef struct {
 } eye_uniform;
 
 static int g_slow = 1;
+static bool g_shaders_only;
 static id<MTLRenderPipelineState> g_scene;
 static id<MTLCommandQueue> g_queue;
 
@@ -181,6 +183,16 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         for (int i = 1; i < argc; i++)
             if (!strcmp(argv[i], "--slow") && i + 1 < argc) g_slow = atoi(argv[++i]) > 1 ? atoi(argv[i]) : 1;
+            else if (!strcmp(argv[i], "--shaders-only")) g_shaders_only = true;
+        if (g_shaders_only) {
+            id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+            if (!dev) { puts("no Metal device; shader not checked"); return 0; }
+            NSError *err = nil;
+            id<MTLLibrary> lib = [dev newLibraryWithSource:@(scene_source) options:nil error:&err];
+            if (!lib) { fprintf(stderr, "scene shader: %s\n", err.localizedDescription.UTF8String); return 1; }
+            puts("scene shader compiles");
+            return 0;
+        }
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         axr_backend_start();   // on the main thread, so the headset window is made right away
