@@ -243,6 +243,7 @@ static uint64_t g_seq;
 // Display.
 static CGDirectDisplayID g_display;
 static NSWindow *g_window;
+void (*axr_on_button_hold)(void);
 static CAMetalLayer *g_layer;
 static CVDisplayLinkRef g_link;
 static id<MTLDevice> g_device;
@@ -1431,7 +1432,7 @@ static void toggle_passthrough(void) {
 
 static void *status_thread(void *arg) {
     (void)arg;
-    bool was_down = false, recentered = false, ps_down[2] = {false, false}, cal_asked = false;
+    bool was_down = false, recentered = false, ps_down[2] = {false, false}, cal_asked = false, hold_asked = false;
     int64_t connected_since = 0, last_stats = axr_now_ns(), last_press = 0, down_since = 0;
     for (;;) {
         struct timespec d = {0, 50000000};
@@ -1449,7 +1450,8 @@ static void *status_thread(void *arg) {
                 pthread_mutex_unlock(&g_lock);
             }
             // A press recenters; a second within 0.45 s also turns the cameras on or off, and
-            // holding it for two seconds calibrates the eye tracker.
+            // holding it for two seconds calibrates the eye tracker, and for five calls
+            // axr_on_button_hold (the self-test quits).
             bool down = psvr2_get_button() == 1;
             if (down && !was_down) {
                 recenter();
@@ -1461,10 +1463,15 @@ static void *status_thread(void *arg) {
                 }
                 down_since = now;
                 cal_asked = false;
+                hold_asked = false;
             }
             if (down && !cal_asked && now - down_since > 2000000000LL) {
                 cal_asked = true;
                 axr_eye_calibrate();
+            }
+            if (down && !hold_asked && now - down_since > 5000000000LL && axr_on_button_hold) {
+                hold_asked = true;
+                axr_on_button_hold();
             }
             was_down = down;
         }

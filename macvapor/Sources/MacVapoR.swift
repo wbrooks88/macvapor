@@ -217,6 +217,10 @@ final class Model: ObservableObject {
     init() {
         refresh()
         checkAudioPermission()
+        // The self-test's window covers the headset display; it must not outlive the app.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+            MainActor.assumeIsolated { self.selftest?.terminate() }
+        }
         // The PS VR2 comes and goes; its status is cheap to read.
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -464,12 +468,20 @@ final class Model: ObservableObject {
             default:
                 output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
             }
+            output += " To end it, press Stop or Esc, hold the headset button for 5 seconds, or quit MacVapoR; it also ends by itself after 10 minutes."
         } catch {
             output = "Could not start the self-test: \(error.localizedDescription)"
         }
     }
 
-    func stopSelftest() { selftest?.terminate() }
+    /// Asks the self-test to quit, then kills it if it hasn't after two seconds.
+    func stopSelftest() {
+        guard let p = selftest else { return }
+        p.terminate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        }
+    }
 
     // MARK: headsets
 

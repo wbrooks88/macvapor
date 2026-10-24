@@ -78,6 +78,7 @@ bool axr_eye_tracking(void);
 // when gaze is true and they are tracked, and stays in the middle otherwise.
 bool axr_foveated_supported(void);
 void axr_eye_calibrate(void);   // PS VR2 only: runs the eye tracker's calibration in the headset
+extern void (*axr_on_button_hold)(void);   // PS VR2 only: called once the headset button is held 5 s
 void axr_foveated_sizes(uint32_t outer[2], uint32_t inset[2]);
 void axr_foveated_inset(int64_t time, bool gaze, float fov[2][4]);
 

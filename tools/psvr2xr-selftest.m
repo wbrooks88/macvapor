@@ -14,6 +14,11 @@
 //   out/psvr2xr-selftest --capture-controllers   the room, while saving what controller tracking
 //                                   sees (camera frames, dots, poses) to ~/Desktop/PS VR2 Controller
 //                                   Capture, to send for a look when the controllers aren't found
+//   out/psvr2xr-selftest --timeout M     quit after M minutes (default 10; 0 runs until stopped)
+//
+// It quits on Esc or Cmd-Q, on holding the headset button for 5 s, when the app that started it
+// (MacVapoR) quits, and after the timeout, so its window over the headset display never stays up.
+// If it is stuck anyway: pkill -f psvr2xr-selftest
 //
 // The room: a floor grid with 1 m squares, a horizon, and four pillars 3 m away: red ahead,
 // green to the right, blue behind and yellow to the left. Straight grid lines and a level horizon
@@ -105,10 +110,47 @@ typedef struct {
     float tip[2][4];    // 20 cm along the controller, trigger
 } eye_uniform;
 
-static int g_slow = 1;
+static int g_slow = 1, g_timeout_min = 10;
 static bool g_shaders_only, g_calibrate_eyes, g_foveated;
 static id<MTLRenderPipelineState> g_scene;
 static id<MTLCommandQueue> g_queue;
+
+static void quit(const char *why) {
+    printf("self-test: quitting (%s)\n", why);
+    fflush(stdout);
+    exit(0);
+}
+
+static void on_button_hold(void) { quit("headset button held"); }
+
+// Every way out, so the headset window can't outlive the test: Esc and Cmd-Q, the headset
+// button, the parent quitting, a timeout.
+static void install_exits(void) {
+    NSMenu *bar = [NSMenu new], *menu = [NSMenu new];
+    NSMenuItem *app = [NSMenuItem new];
+    [menu addItemWithTitle:@"Quit Self-Test" action:@selector(terminate:) keyEquivalent:@"q"];
+    app.submenu = menu;
+    [bar addItem:app];
+    NSApp.mainMenu = bar;
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *e) {
+        if (e.keyCode == 53) quit("Esc");   // kVK_Escape
+        return e;
+    }];
+    axr_on_button_hold = on_button_hold;
+    pid_t parent = getppid();
+    if (parent > 1) {
+        dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, parent, DISPATCH_PROC_EXIT,
+                                                       dispatch_get_main_queue());
+        dispatch_source_set_event_handler(src, ^{ quit("the app that started it quit"); });
+        dispatch_resume(src);
+        (void)CFBridgingRetain(src);
+        if (getppid() != parent) quit("the app that started it quit");
+    }
+    if (g_timeout_min > 0)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)g_timeout_min * 60 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{ quit("timed out"); });
+    [NSApp activateIgnoringOtherApps:YES];
+}
 
 static void matrix_from(const float q[4], float m[16]) {   // x, y, z, w; column-major
     float x = q[0], y = q[1], z = q[2], w = q[3];
@@ -204,6 +246,7 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         for (int i = 1; i < argc; i++)
             if (!strcmp(argv[i], "--slow") && i + 1 < argc) g_slow = atoi(argv[++i]) > 1 ? atoi(argv[i]) : 1;
+            else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) g_timeout_min = atoi(argv[++i]);
             else if (!strcmp(argv[i], "--shaders-only")) g_shaders_only = true;
             else if (!strcmp(argv[i], "--calibrate-eyes")) g_calibrate_eyes = true;
             else if (!strcmp(argv[i], "--foveated")) g_foveated = true;
@@ -243,7 +286,8 @@ int main(int argc, char **argv) {
                "the red pillar again. Sense controllers show as cyan (left) and magenta (right) balls; pull\n"
                "a trigger to light one and feel it buzz, press PS to point it forward again.\n"
                "Status every 5 s here and in ~/Library/Logs/psvr2xr.log.\n"
-               "Quit with Ctrl-C.\n");
+               "Quit with Esc, Cmd-Q or Ctrl-C, or hold the headset button for 5 s; it quits by itself\n"
+               "when MacVapoR quits%s.\n", g_timeout_min > 0 ? [NSString stringWithFormat:@" and after %d minutes", g_timeout_min].UTF8String : "");
         if (g_calibrate_eyes)
             printf("Eye calibration starts as soon as the headset tracks: look at each dot until the next one\n"
                    "appears. Afterwards the room comes back with a yellow ring where you look.\n");
@@ -258,6 +302,7 @@ int main(int argc, char **argv) {
                 axr_eye_calibrate();
             });
         }
+        install_exits();
         [NSApp run];
     }
     return 0;
