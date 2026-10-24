@@ -10,7 +10,8 @@
 // Monado's driver). Position is a neck model unless config.json asks for the experimental SLAM
 // position. The Sense controllers come over Bluetooth (sense.c): their buttons, sticks, triggers
 // and orientation, placed by an arm model, since their position needs camera tracking that no open
-// code does on a Mac yet.
+// code does on a Mac yet. A double press of the headset's button shows the room through its
+// front cameras in place of the game, and another goes back.
 
 #import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -208,6 +209,12 @@ static id<MTLRenderPipelineState> g_pipeline;
 static id<MTLBuffer> g_lut;
 static id<MTLTexture> g_blank;     // bound before the first game frame, which the shader then skips
 
+// Passthrough: the headset's cameras in place of the game (double press of the headset button).
+// The status thread powers them; the compositor uploads their frames as two BC4 textures.
+static volatile bool g_passthrough;
+static id<MTLTexture> g_cam[2];
+static unsigned char *g_cam_buf[2];
+
 static unsigned g_stat_submits, g_stat_dropped, g_stat_composed, g_stat_repeated, g_stat_no_drawable;
 static uint64_t g_last_composed_seq;
 
@@ -218,8 +225,9 @@ typedef struct {
     float calib_l[4], calib_r[4];
     float delta[16];
     float p0[4];
+    float p1[4];
 } compose_uniform;
-_Static_assert(sizeof(compose_uniform) == 112, "Uni layout");
+_Static_assert(sizeof(compose_uniform) == 128, "Uni layout");
 
 id<MTLDevice> axr_metal_device(void) {
     static dispatch_once_t once;
@@ -584,6 +592,36 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
 
 // ---------------------------------------------------------------------------------- compositor
 
+// The newest camera frames, in new textures each time so a frame still on the GPU is left alone,
+// as psvr2-player-mac does. False until the first frame after the cameras come on.
+static bool update_camera_textures(void) {
+    if (!g_passthrough) {
+        g_cam[0] = g_cam[1] = nil;
+        return false;
+    }
+    if (!g_cam_buf[0]) {
+        g_cam_buf[0] = malloc(PSVR2_CAM_PLANE_BYTES);
+        g_cam_buf[1] = malloc(PSVR2_CAM_PLANE_BYTES);
+        if (!g_cam_buf[0] || !g_cam_buf[1]) return false;
+    }
+    if (psvr2_camera_get_frame(g_cam_buf[0], g_cam_buf[1]) == 1) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC4_RUnorm
+                                                                                     width:PSVR2_CAM_WIDTH
+                                                                                    height:PSVR2_CAM_HEIGHT
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        for (int i = 0; i < 2; i++) {
+            id<MTLTexture> t = [g_device newTextureWithDescriptor:d];
+            // BC4: a 4x4 block is 8 bytes, so a row of blocks is width * 2 bytes
+            [t replaceRegion:MTLRegionMake2D(0, 0, PSVR2_CAM_WIDTH, PSVR2_CAM_HEIGHT) mipmapLevel:0
+                   withBytes:g_cam_buf[i] bytesPerRow:PSVR2_CAM_WIDTH * 2];
+            g_cam[i] = t;
+        }
+    }
+    return g_cam[0] && g_cam[1];
+}
+
 static void compose(int64_t scanout) {
     CAMetalLayer *layer = g_layer;
     if (!layer || !g_pipeline) return;
@@ -606,10 +644,13 @@ static void compose(int64_t scanout) {
     float ahead = ((float)(scanout - axr_now_ns()) + g_cfg.lookahead_ms * 1e6f) / 1e9f + 0.5f / (float)refresh;
     quat now = rendered;
     bool turned = g_cfg.reprojection && s >= 0 && head_orientation(ahead, &now);
+    bool cameras = update_camera_textures();
+    // Lens angle, brightness and convergence: psvr2-player-mac's defaults, tuned there by eye
     compose_uniform u = {
         .calib_l = {g_calib[0], g_calib[1], g_calib[4], g_calib[5]},
         .calib_r = {g_calib[2], g_calib[3], g_calib[6], g_calib[7]},
         .p0 = {s >= 0 ? 1 : 0, g_cfg.chromatic ? 1 : 0, 0, 0},
+        .p1 = {cameras ? 1 : 0, 150.0f * (float)M_PI / 180.0f, 1.6f, 0.100f},
     };
     qmatrix(turned ? qnorm(qmul(qconj(rendered), now)) : QID, u.delta);
 
@@ -632,6 +673,8 @@ static void compose(int64_t scanout) {
     [enc setFragmentBuffer:g_lut offset:0 atIndex:1];
     [enc setFragmentTexture:left ?: g_blank atIndex:0];
     [enc setFragmentTexture:right ?: g_blank atIndex:1];
+    [enc setFragmentTexture:cameras ? g_cam[0] : g_blank atIndex:2];
+    [enc setFragmentTexture:cameras ? g_cam[1] : g_blank atIndex:3];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
     [cmd presentDrawable:drawable];
@@ -743,10 +786,25 @@ static void on_main(void (^block)(void)) {
 
 // -------------------------------------------------------------------------------------- status
 
+// The room through the headset's cameras in place of the game, or back to the game. The game keeps
+// running underneath.
+static void toggle_passthrough(void) {
+    if (g_passthrough) {
+        g_passthrough = false;
+        psvr2_camera_stop();
+        axr_log("passthrough off, back to the game");
+    } else if (psvr2_camera_start() == 0) {
+        g_passthrough = true;
+        axr_log("passthrough on: the headset's cameras (double press the headset button again to go back)");
+    } else {
+        axr_log("passthrough: the cameras did not start");
+    }
+}
+
 static void *status_thread(void *arg) {
     (void)arg;
     bool was_down = false, recentered = false, ps_down[2] = {false, false};
-    int64_t connected_since = 0, last_stats = axr_now_ns();
+    int64_t connected_since = 0, last_stats = axr_now_ns(), last_press = 0;
     for (;;) {
         struct timespec d = {0, 50000000};
         nanosleep(&d, NULL);
@@ -762,8 +820,17 @@ static void *status_thread(void *arg) {
                 g_tracking_ready = true;
                 pthread_mutex_unlock(&g_lock);
             }
+            // A press recenters; a second within 0.45 s also turns the cameras on or off
             bool down = psvr2_get_button() == 1;
-            if (down && !was_down) recenter();
+            if (down && !was_down) {
+                recenter();
+                if (now - last_press < 450000000) {
+                    toggle_passthrough();
+                    last_press = 0;
+                } else {
+                    last_press = now;
+                }
+            }
             was_down = down;
         }
         // A controller that has just connected, or whose PS button was pressed, points where the

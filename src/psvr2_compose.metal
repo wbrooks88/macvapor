@@ -19,6 +19,8 @@ struct Uni {
     float4 calibR;
     float4x4 delta;    // a direction in the head now -> in the head the game rendered for
     float4 p0;         // x: a game frame is there, y: chromatic correction
+    float4 p1;         // passthrough: x: a camera frame is there, y: lens angle (rad), z: brightness,
+                       // w: convergence (fractions of the frame)
 };
 
 // The game's eye images cover this much of tan space: x from -cx / FX to (1 - cx) / FX, y from
@@ -28,7 +30,8 @@ constant float FY = 0.3762281;
 
 fragment float4 fs(VOut in [[stage_in]], constant Uni &u [[buffer(0)]],
                    device const packed_float3 *lut [[buffer(1)]],
-                   texture2d<float> left [[texture(0)]], texture2d<float> right [[texture(1)]]) {
+                   texture2d<float> left [[texture(0)]], texture2d<float> right [[texture(1)]],
+                   texture2d<float> camL [[texture(2)]], texture2d<float> camR [[texture(3)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     int eye = in.uv.x < 0.5 ? 0 : 1;
     float fU = eye == 0 ? in.uv.x * 2.0 : (in.uv.x - 0.5) * 2.0;
@@ -48,6 +51,27 @@ fragment float4 fs(VOut in [[stage_in]], constant Uni &u [[buffer(0)]],
     } else {
         float v = Rs - 1023.0;
         scale = float3(v * 0.003648639 + 1.592586, v * 0.004862547 + 1.692979, v * 0.007425308 + 1.841771);
+    }
+
+    // Passthrough: the headset's front cameras in place of the game, as psvr2-player-mac shows
+    // them. They move with the head, so no head turn applies: an equidistant fisheye straight
+    // ahead, each eye from its own camera, shifted toward the other since the cameras sit wider
+    // apart than the eyes. The picture is grayscale (the cameras are monochrome).
+    if (u.p1.x > 0.5) {
+        float a = local_x * scale[1];
+        float b = (local_y - 0.0002302693) * scale[1];
+        float3 dir = normalize(float3(k3 * a - k4 * b, -(k4 * a + k3 * b), -1.0));
+        float theta = acos(clamp(-dir.z, -1.0, 1.0));
+        float r = theta / u.p1.y;
+        if (r > 0.5) { return float4(0.0, 0.0, 0.0, 1.0); }
+        float len = length(dir.xy);
+        float2 dd = len > 1e-6 ? dir.xy / len : float2(0.0);
+        float shift = eye == 0 ? u.p1.w : -u.p1.w;
+        float2 cuv = float2((0.5 + r * dd.x + shift) * (1016.0 / 1024.0), 0.5 - r * dd.y);   // 1016 wide in 1024
+        float g = saturate((eye == 0 ? camL : camR).sample(s, cuv).r * u.p1.z);
+        // The player writes this value to a plain BGRA panel; this one is sRGB, so undo its encoding
+        float lin = g <= 0.04045 ? g / 12.92 : pow((g + 0.055) / 1.055, 2.4);
+        return float4(float3(lin), 1.0);
     }
 
     if (u.p0.x < 0.5) { return float4(0.08, 0.08, 0.08, 1.0); }   // no game frame yet

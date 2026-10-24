@@ -15,6 +15,8 @@ What works in this first stage:
   since it was rendered, so turning your head stays smooth when the game runs below the panel's
   rate. That matters on a MacBook Air.
 - Recentering with the headset's Fn button.
+- Passthrough: double-press the Fn button to see the room through the headset's front cameras
+  (grayscale) in place of the game, and double-press again to go back. The game keeps running.
 - The Sense controllers over Bluetooth: buttons, sticks, triggers, finger sensors, vibration, and
   orientation from each controller's own motion sensor. Games see them as Quest Touch controllers.
 
