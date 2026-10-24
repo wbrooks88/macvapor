@@ -10,6 +10,10 @@ import CoreGraphics
 import IOKit
 import SwiftUI
 
+// macOS 27 SDKs declare a State() macro whose plugin ships only with Xcode, so the Command
+// Line Tools cannot expand @State. The alias names the property wrapper type directly.
+typealias ViewState<Value> = SwiftUI.State<Value>
+
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
     static let support = home.appending(path: "Library/Application Support/MacVapoR")
@@ -742,7 +746,7 @@ enum GameScanner {
 
 struct ContentView: View {
     @EnvironmentObject var model: Model
-    @State private var vrOnly = true
+    @ViewState private var vrOnly = true
 
     var body: some View {
         ScrollView {
@@ -1024,7 +1028,7 @@ struct ContentView: View {
 struct GameRow: View {
     @EnvironmentObject var model: Model
     let game: Game
-    @State private var exe = ""
+    @ViewState private var exe = ""
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
