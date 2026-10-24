@@ -9,9 +9,10 @@
 // slower than the panel. Head rotation comes over USB (src/psvr2/, from psvr2-player-mac and
 // Monado's driver). Position is a neck model unless config.json asks for the experimental SLAM
 // position. The Sense controllers come over Bluetooth (sense.c): their buttons, sticks, triggers
-// and orientation, placed by an arm model, since their position needs camera tracking that no open
-// code does on a Mac yet. A double press of the headset's button shows the room through its
-// front cameras in place of the game, and another goes back.
+// and orientation. Their position comes from the headset's lower cameras seeing their LED rings
+// (sense_track.c), and from an arm model while the cameras can't see them. A double press of the
+// headset's button shows the room through its front cameras in place of the game, and another
+// goes back.
 //
 // The headset's eye tracker comes over the same USB (cpsvr2.c): games that ask for eye gaze get it
 // (XR_EXT_eye_gaze_interaction), games that render quad views get a sharp inset that follows the
@@ -32,6 +33,7 @@
 #include "alvrxr.h"
 #include "psvr2/cpsvr2.h"
 #include "sense.h"
+#include "sense_track.h"
 
 unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // runtime.m's frame and input counts
 unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
@@ -90,6 +92,9 @@ typedef struct {
     bool reprojection;    // turn each frame by the head's rotation since it was rendered
     bool positional;      // experimental: the headset's SLAM position instead of the neck model
     bool controllers;     // the Sense controllers over Bluetooth
+    bool controller_tracking;      // their position from the headset's cameras
+    float controller_latency_ms;   // from a camera frame's exposure to its arrival over USB
+    float controller_threshold;    // 0..255: how bright an LED's dot is in the camera picture
     bool eye_tracking;    // the headset's eye tracker
     bool show_gaze;       // a ring where the eyes look, to check the eye tracker
     bool foveated;        // offer quad views (a gaze-following sharp inset) to games that use them
@@ -100,7 +105,8 @@ typedef struct {
 
 static NSString *g_config_dir;
 static config g_cfg = {.render_scale = 0.75f, .eye_height = 1.6f, .chromatic = true, .reprojection = true,
-                       .controllers = true, .eye_tracking = true, .foveated = true, .foveated_area_deg = 40,
+                       .controllers = true, .controller_tracking = true, .controller_latency_ms = 25,
+                       .controller_threshold = 170, .eye_tracking = true, .foveated = true, .foveated_area_deg = 40,
                        .foveated_outer_scale = 0.5f, .foveated_inset_scale = 1.0f};
 
 static void read_config(void) {
@@ -113,6 +119,9 @@ static void read_config(void) {
             @"lookahead_ms" : @(g_cfg.lookahead_ms), @"chromatic" : @(g_cfg.chromatic),
             @"reprojection" : @(g_cfg.reprojection), @"positional" : @(g_cfg.positional),
             @"controllers" : @(g_cfg.controllers), @"eye_tracking" : @(g_cfg.eye_tracking),
+            @"controller_tracking" : @(g_cfg.controller_tracking),
+            @"controller_latency_ms" : @(g_cfg.controller_latency_ms),
+            @"controller_threshold" : @(g_cfg.controller_threshold),
             @"show_gaze" : @(g_cfg.show_gaze), @"foveated" : @(g_cfg.foveated),
             @"foveated_area_deg" : @(g_cfg.foveated_area_deg), @"foveated_outer_scale" : @(g_cfg.foveated_outer_scale),
             @"foveated_inset_scale" : @(g_cfg.foveated_inset_scale),
@@ -130,6 +139,11 @@ static void read_config(void) {
     if (c[@"reprojection"]) g_cfg.reprojection = [c[@"reprojection"] boolValue];
     if (c[@"positional"]) g_cfg.positional = [c[@"positional"] boolValue];
     if (c[@"controllers"]) g_cfg.controllers = [c[@"controllers"] boolValue];
+    if (c[@"controller_tracking"]) g_cfg.controller_tracking = [c[@"controller_tracking"] boolValue];
+    if (c[@"controller_latency_ms"])
+        g_cfg.controller_latency_ms = fmaxf(0, fminf(100, [c[@"controller_latency_ms"] floatValue]));
+    if (c[@"controller_threshold"])
+        g_cfg.controller_threshold = fmaxf(40, fminf(254, [c[@"controller_threshold"] floatValue]));
     if (c[@"eye_tracking"]) g_cfg.eye_tracking = [c[@"eye_tracking"] boolValue];
     if (c[@"show_gaze"]) g_cfg.show_gaze = [c[@"show_gaze"] boolValue];
     if (c[@"foveated"]) g_cfg.foveated = [c[@"foveated"] boolValue];
@@ -142,7 +156,7 @@ static void read_config(void) {
             " controllers %s",
             g_cfg.render_scale, g_cfg.eye_height, g_cfg.lookahead_ms, g_cfg.chromatic ? "on" : "off",
             g_cfg.reprojection ? "on" : "off", g_cfg.positional ? "SLAM position (experimental)" : "neck model",
-            g_cfg.controllers ? "on" : "off");
+            g_cfg.controllers ? (g_cfg.controller_tracking ? "on, tracked by the headset's cameras" : "on, arm model only") : "off");
     axr_log("config: eye tracking %s, gaze ring %s, foveated rendering %s (inset %.0f deg at %.2f, rest at %.2f)",
             g_cfg.eye_tracking ? "on" : "off", g_cfg.show_gaze ? "on" : "off", g_cfg.foveated ? "offered" : "off",
             g_cfg.foveated_area_deg, g_cfg.foveated_inset_scale, g_cfg.foveated_outer_scale);
@@ -296,6 +310,33 @@ static bool slam_position(float out[3]) {
     return true;
 }
 
+// ------------------------------------------------------------------------ controller tracking
+//
+// The headset's lower cameras see the controllers' LEDs, which sense.c keeps lit while this runs.
+// The camera thread hands each frame to tracking_thread, which finds the controllers in it
+// (sense_track.c) and feeds a smoothed position for each into g_optical. hand_motion uses that
+// while it is fresh, and the arm model otherwise, easing from one to the other. The tracker also
+// tells how far each controller's IMU yaw has drifted, and g_ctl_yaw takes that in bit by bit.
+
+static strack *g_tracker;                   // the tracking thread's
+static strack_filter g_optical[2];          // under g_lock
+static int64_t g_optical_seen[2];           // exposure time of the last frame each was seen in
+static volatile bool g_tracker_reset;       // the world turned (recentering): start following afresh
+static struct {
+    bool optical;            // what the position was based on last time
+    float from[3];           // the offset being eased out after a switch
+    int64_t since;
+    float last[3];
+    bool have_last;
+} g_blend[2];                // under g_lock
+
+static bool optically_tracked(int hand, int64_t within_ns) {
+    pthread_mutex_lock(&g_lock);
+    bool seen = g_optical_seen[hand] && axr_now_ns() - g_optical_seen[hand] < within_ns;
+    pthread_mutex_unlock(&g_lock);
+    return seen;
+}
+
 // ------------------------------------------------------------------------------- controllers
 //
 // A controller's orientation comes from its own IMU, level with gravity but with a yaw that is
@@ -340,6 +381,7 @@ static void recenter(void) {
     qrot(o, f, fwd);
     float yaw = atan2f(-fwd[0], -fwd[2]);
     pthread_mutex_lock(&g_lock);
+    quat turn = qnorm(qmul(qyaw(-yaw), qconj(g_recenter)));   // how the room turns
     g_recenter = qyaw(-yaw);
     pthread_mutex_unlock(&g_lock);
     float pos[3];
@@ -349,7 +391,19 @@ static void recenter(void) {
         pthread_mutex_unlock(&g_lock);
     }
     axr_log("recentered (turned %.0f deg)", yaw * 180 / M_PI);
-    for (int h = 0; h < 2; h++) align_controller(h, 0);
+    // A controller the cameras follow keeps its place in the room, which turns with the head's
+    // forward; one they don't points where the head now faces.
+    for (int h = 0; h < 2; h++) {
+        if (optically_tracked(h, 2000000000LL)) {
+            pthread_mutex_lock(&g_lock);
+            g_ctl_yaw[h] = qnorm(qmul(turn, g_ctl_yaw[h]));
+            g_optical[h].have = false;
+            pthread_mutex_unlock(&g_lock);
+        } else {
+            align_controller(h, 0);
+        }
+    }
+    g_tracker_reset = true;
 }
 
 // The orientation a frame for display time t is rendered with: the one predicted for it at
@@ -429,7 +483,260 @@ static axr_motion hand_motion(int hand, int64_t time) {
     m.linear_velocity[1] = w[2] * hand_off[0] - w[0] * hand_off[2];
     m.linear_velocity[2] = w[0] * hand_off[1] - w[1] * hand_off[0];
     m.valid = true;
+
+    // Where the cameras saw it, carried forward to this time, if they saw it lately. A switch
+    // between that and the arm model eases over a fraction of a second instead of jumping.
+    float seen[3], vel[3], base[3];
+    pthread_mutex_lock(&g_lock);
+    bool optical = g_cfg.controller_tracking && strack_filter_predict(&g_optical[hand], time, 250000000, seen, vel);
+    memcpy(base, optical ? seen : m.pose.position, sizeof base);
+    if (optical != g_blend[hand].optical) {
+        for (int i = 0; i < 3; i++) g_blend[hand].from[i] = g_blend[hand].have_last ? g_blend[hand].last[i] - base[i] : 0;
+        g_blend[hand].since = time;
+        g_blend[hand].optical = optical;
+    }
+    float age = (time - g_blend[hand].since) / 1e9f, ease = age > 0 ? expf(-age / (optical ? 0.12f : 0.25f)) : 1;
+    for (int i = 0; i < 3; i++) m.pose.position[i] = base[i] + g_blend[hand].from[i] * ease;
+    memcpy(g_blend[hand].last, m.pose.position, sizeof g_blend[hand].last);
+    g_blend[hand].have_last = true;
+    pthread_mutex_unlock(&g_lock);
+    if (optical) memcpy(m.linear_velocity, vel, sizeof vel);
     return m;
+}
+
+// The camera thread's newest frame, waiting for tracking_thread.
+static pthread_mutex_t g_track_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_track_cond = PTHREAD_COND_INITIALIZER;
+static unsigned char *g_track_planes[2], g_track_header[256];
+static double g_track_arrived;
+static bool g_track_pending;
+
+// Statistics for the status line, under g_lock.
+static unsigned g_stat_track_frames, g_stat_track_dots[2], g_stat_track_seen[2], g_stat_track_leds[2];
+static float g_stat_track_rms[2];
+
+static void camera_frame(const unsigned char *header, const unsigned char *left, const unsigned char *right,
+                         double arrived_s, void *ctx) {
+    (void)ctx;
+    pthread_mutex_lock(&g_track_lock);
+    memcpy(g_track_planes[0], left, PSVR2_CAM_PLANE_BYTES);
+    memcpy(g_track_planes[1], right, PSVR2_CAM_PLANE_BYTES);
+    memcpy(g_track_header, header, sizeof g_track_header);
+    g_track_arrived = arrived_s;
+    g_track_pending = true;
+    pthread_cond_signal(&g_track_cond);
+    pthread_mutex_unlock(&g_track_lock);
+}
+
+// <config>/controller_cameras.json: where the two lower cameras sit and point and how their lenses
+// bend, in sense_track.h's terms. Written with the guess on first run; the tracker calibrates it as
+// it goes, and the calibrated cameras are saved back so the next run starts from them.
+static NSString *cameras_path(void) { return [g_config_dir stringByAppendingPathComponent:@"controller_cameras.json"]; }
+
+static void save_cameras(const strack_camera cams[STRACK_CAMERAS], int calibrations) {
+    NSMutableArray *list = [NSMutableArray array];
+    for (int c = 0; c < STRACK_CAMERAS; c++) {
+        const strack_camera *k = &cams[c];
+        [list addObject:@{
+            @"camera" : c == 0 ? @"lower left" : @"lower right",
+            @"f" : @(k->f), @"cx" : @(k->cx), @"cy" : @(k->cy),
+            @"k" : @[ @(k->k[0]), @(k->k[1]), @(k->k[2]), @(k->k[3]) ],
+            @"max_angle_deg" : @(k->max_angle_deg), @"width" : @(k->width), @"height" : @(k->height),
+            @"position" : @[ @(k->position[0]), @(k->position[1]), @(k->position[2]) ],
+            @"yaw_deg" : @(k->yaw_deg), @"pitch_deg" : @(k->pitch_deg), @"roll_deg" : @(k->roll_deg),
+            @"calibrations" : @(calibrations),
+        }];
+    }
+    [[NSJSONSerialization dataWithJSONObject:list options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
+        writeToFile:cameras_path() atomically:YES];
+}
+
+static void load_cameras(strack_camera cams[STRACK_CAMERAS]) {
+    strack_default_cameras(cams);
+    NSData *data = [NSData dataWithContentsOfFile:cameras_path()];
+    NSArray *list = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![list isKindOfClass:NSArray.class] || list.count != STRACK_CAMERAS) {
+        save_cameras(cams, 0);
+        return;
+    }
+    for (int c = 0; c < STRACK_CAMERAS; c++) {
+        NSDictionary *d = list[c];
+        if (![d isKindOfClass:NSDictionary.class]) continue;
+        strack_camera *k = &cams[c];
+        if (d[@"f"]) k->f = fmaxf(100, fminf(1000, [d[@"f"] floatValue]));
+        if (d[@"cx"]) k->cx = [d[@"cx"] floatValue];
+        if (d[@"cy"]) k->cy = [d[@"cy"] floatValue];
+        NSArray *kk = d[@"k"];
+        if ([kk isKindOfClass:NSArray.class] && kk.count == 4)
+            for (int i = 0; i < 4; i++) k->k[i] = [kk[i] floatValue];
+        if (d[@"max_angle_deg"]) k->max_angle_deg = fmaxf(30, fminf(89, [d[@"max_angle_deg"] floatValue]));
+        NSArray *pos = d[@"position"];
+        if ([pos isKindOfClass:NSArray.class] && pos.count == 3)
+            for (int i = 0; i < 3; i++) k->position[i] = [pos[i] floatValue];
+        if (d[@"yaw_deg"]) k->yaw_deg = [d[@"yaw_deg"] floatValue];
+        if (d[@"pitch_deg"]) k->pitch_deg = [d[@"pitch_deg"] floatValue];
+        if (d[@"roll_deg"]) k->roll_deg = [d[@"roll_deg"] floatValue];
+    }
+}
+
+// --capture-controllers (PSVR2XR_CAPTURE_DIR): every 15th camera frame, up to 60, as it came
+// (frame_NNN.bin: the 256-byte header, then the left and right BC4 planes), with a line per frame
+// in frames.jsonl of what the tracker was given and found, to work out from them what's wrong.
+static FILE *g_capture;
+static NSString *g_capture_dir;
+static unsigned g_capture_frames, g_capture_saved;
+
+static void capture_frame(const unsigned char *header, unsigned char *const planes[2], const strack_input *in,
+                          const strack_result r[2]) {
+    if (!g_capture || g_capture_saved >= 60 || g_capture_frames++ % 15) return;
+    NSString *name = [NSString stringWithFormat:@"frame_%03u.bin", g_capture_saved++];
+    FILE *f = fopen([g_capture_dir stringByAppendingPathComponent:name].fileSystemRepresentation, "wb");
+    if (f) {
+        fwrite(header, 1, 256, f);
+        fwrite(planes[0], 1, PSVR2_CAM_PLANE_BYTES, f);
+        fwrite(planes[1], 1, PSVR2_CAM_PLANE_BYTES, f);
+        fclose(f);
+    }
+    fprintf(g_capture, "{\"file\": \"%s\", \"time_ns\": %lld, \"head\": {\"q\": [%.6f, %.6f, %.6f, %.6f], \"p\": [%.4f, %.4f, %.4f]}",
+            name.UTF8String, (long long)in->time_ns, in->head.q[0], in->head.q[1], in->head.q[2], in->head.q[3],
+            in->head.p[0], in->head.p[1], in->head.p[2]);
+    for (int h = 0; h < 2; h++) {
+        fprintf(g_capture, ", \"%s\": {\"imu\": %s", h ? "right" : "left", in->prior_valid[h] ? "true" : "false");
+        if (in->prior_valid[h])
+            fprintf(g_capture, ", \"prior_q\": [%.6f, %.6f, %.6f, %.6f]", in->prior_q[h][0], in->prior_q[h][1],
+                    in->prior_q[h][2], in->prior_q[h][3]);
+        if (r[h].valid)
+            fprintf(g_capture, ", \"q\": [%.6f, %.6f, %.6f, %.6f], \"p\": [%.4f, %.4f, %.4f], \"leds\": %d, \"rms_px\": %.2f",
+                    r[h].pose.q[0], r[h].pose.q[1], r[h].pose.q[2], r[h].pose.q[3], r[h].pose.p[0], r[h].pose.p[1],
+                    r[h].pose.p[2], r[h].leds, r[h].rms_px);
+        fprintf(g_capture, "}");
+    }
+    for (int c = 0; c < STRACK_CAMERAS; c++) {
+        int n;
+        const strack_blob *b = strack_blobs(g_tracker, c, &n);
+        fprintf(g_capture, ", \"dots_%s\": [", c ? "right" : "left");
+        for (int i = 0; i < n; i++)
+            fprintf(g_capture, "%s[%.2f, %.2f, %d, %.0f]", i ? ", " : "", b[i].x, b[i].y, b[i].area, b[i].brightness);
+        fprintf(g_capture, "]");
+    }
+    fprintf(g_capture, "}\n");
+    fflush(g_capture);
+    if (g_capture_saved == 60) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
+}
+
+static void *tracking_thread(void *arg) {
+    (void)arg;
+    unsigned char *planes[2] = {malloc(PSVR2_CAM_PLANE_BYTES), malloc(PSVR2_CAM_PLANE_BYTES)}, header[256];
+    if (!planes[0] || !planes[1]) return NULL;
+    int saved_calibrations = 0;
+    int64_t last_save = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_track_lock);
+        while (!g_track_pending) pthread_cond_wait(&g_track_cond, &g_track_lock);
+        g_track_pending = false;
+        memcpy(planes[0], g_track_planes[0], PSVR2_CAM_PLANE_BYTES);
+        memcpy(planes[1], g_track_planes[1], PSVR2_CAM_PLANE_BYTES);
+        memcpy(header, g_track_header, sizeof header);
+        int64_t exposed = (int64_t)(g_track_arrived * 1e9) - (int64_t)(g_cfg.controller_latency_ms * 1e6f);
+        pthread_mutex_unlock(&g_track_lock);
+
+        if (g_tracker_reset) {
+            g_tracker_reset = false;
+            strack_forget(g_tracker);
+        }
+        int dots[2];
+        for (int c = 0; c < STRACK_CAMERAS; c++) dots[c] = strack_detect_bc4(g_tracker, c, planes[c], PSVR2_CAM_WIDTH / 4);
+
+        // The head then, and each controller's orientation from its IMU.
+        strack_input in = {.time_ns = exposed};
+        quat hq = QID;
+        head_orientation((exposed - axr_now_ns()) / 1e9f, &hq);
+        axr_pose hp = head_pose(hq);
+        in.head.q[0] = hq.x; in.head.q[1] = hq.y; in.head.q[2] = hq.z; in.head.q[3] = hq.w;
+        memcpy(in.head.p, hp.position, sizeof in.head.p);
+        for (int h = 0; h < 2; h++) {
+            sense_state st;
+            if (!sense_get(h, &st) || !st.updated_ns || axr_now_ns() - (int64_t)st.updated_ns > 200000000 || !sense_leds_on(h))
+                continue;
+            pthread_mutex_lock(&g_lock);
+            bool aligned = g_ctl_aligned[h];
+            quat g = qnorm(qmul(g_ctl_yaw[h], raw_grip(&st)));
+            pthread_mutex_unlock(&g_lock);
+            if (!aligned) continue;
+            in.prior_valid[h] = true;
+            in.prior_q[h][0] = g.x; in.prior_q[h][1] = g.y; in.prior_q[h][2] = g.z; in.prior_q[h][3] = g.w;
+        }
+        strack_result r[2];
+        strack_solve(g_tracker, &in, r);
+
+        pthread_mutex_lock(&g_lock);
+        g_stat_track_frames++;
+        for (int c = 0; c < STRACK_CAMERAS; c++) g_stat_track_dots[c] += dots[c];
+        for (int h = 0; h < 2; h++) {
+            if (!r[h].valid) continue;
+            strack_filter_update(&g_optical[h], r[h].pose.p, exposed);
+            g_optical_seen[h] = exposed;
+            // The IMU's yaw toward the cameras', a tenth at a time, so it doesn't jitter.
+            float a = 0.1f * r[h].yaw_error;
+            g_ctl_yaw[h] = qnorm(qmul(qyaw(a), g_ctl_yaw[h]));
+            strack_shift_yaw(g_tracker, h, a);
+            g_stat_track_seen[h]++;
+            g_stat_track_leds[h] += r[h].leds;
+            g_stat_track_rms[h] += r[h].rms_px;
+        }
+        pthread_mutex_unlock(&g_lock);
+
+        capture_frame(header, planes, &in, r);
+        float rms;
+        int calibrations = strack_calibration(g_tracker, &rms);
+        if (calibrations > saved_calibrations && axr_now_ns() - last_save > 20000000000LL) {
+            strack_camera cams[STRACK_CAMERAS];
+            strack_get_cameras(g_tracker, cams);
+            save_cameras(cams, calibrations);
+            axr_log("controller cameras calibrated (%d times, fit %.2f px): left f %.1f yaw %.1f pitch %.1f roll %.1f,"
+                    " right f %.1f yaw %.1f pitch %.1f roll %.1f; saved to %s", calibrations, rms, cams[0].f,
+                    cams[0].yaw_deg, cams[0].pitch_deg, cams[0].roll_deg, cams[1].f, cams[1].yaw_deg, cams[1].pitch_deg,
+                    cams[1].roll_deg, cameras_path().UTF8String);
+            saved_calibrations = calibrations;
+            last_save = axr_now_ns();
+        }
+    }
+    return NULL;
+}
+
+static void start_controller_tracking(void) {
+    strack_camera cams[STRACK_CAMERAS];
+    load_cameras(cams);
+    strack_params prm;
+    strack_default_params(&prm);
+    prm.threshold = g_cfg.controller_threshold;
+    g_tracker = strack_create(cams, &prm);
+    g_track_planes[0] = malloc(PSVR2_CAM_PLANE_BYTES);
+    g_track_planes[1] = malloc(PSVR2_CAM_PLANE_BYTES);
+    if (!g_tracker || !g_track_planes[0] || !g_track_planes[1]) { axr_log("controller tracking: out of memory"); return; }
+    const char *capture = getenv("PSVR2XR_CAPTURE_DIR");
+    if (capture) {
+        g_capture_dir = @(capture);
+        [NSFileManager.defaultManager createDirectoryAtPath:g_capture_dir withIntermediateDirectories:YES attributes:nil error:nil];
+        g_capture = fopen([g_capture_dir stringByAppendingPathComponent:@"frames.jsonl"].fileSystemRepresentation, "w");
+        save_cameras(cams, 0);
+        [NSFileManager.defaultManager copyItemAtPath:cameras_path()
+                                              toPath:[g_capture_dir stringByAppendingPathComponent:@"controller_cameras.json"]
+                                               error:nil];
+        axr_log("controller capture: saving camera frames to %s", capture);
+    }
+    psvr2_camera_set_listener(camera_frame, NULL);
+    if (psvr2_camera_start() != 0) {
+        axr_log("controller tracking: the headset's cameras did not start; using the arm model");
+        psvr2_camera_set_listener(NULL, NULL);
+        return;
+    }
+    sense_tracking_leds(true);
+    pthread_t t;
+    pthread_create(&t, NULL, tracking_thread, NULL);
+    pthread_detach(t);
+    axr_log("controller tracking on: lower cameras f %.0f, turned %.0f/%.0f deg out and %.0f down (%s)", cams[0].f,
+            cams[0].yaw_deg, -cams[1].yaw_deg, -cams[0].pitch_deg, cameras_path().UTF8String);
 }
 
 // ------------------------------------------------------------------------------------------ eyes
@@ -1166,8 +1473,14 @@ static void *status_thread(void *arg) {
             pthread_mutex_unlock(&g_lock);
             bool ps = on && (s.buttons & SENSE_PS);
             if (on && (!aligned || (ps && !ps_down[h]))) {
-                align_controller(h, yaw_of(head));
-                if (aligned) axr_log("%s controller recentered", h == SENSE_LEFT ? "left" : "right");
+                // The cameras keep a controller they see pointing the right way by themselves.
+                if (aligned && optically_tracked(h, 1000000000)) {
+                    axr_log("%s controller: PS pressed, but the cameras see it, so it keeps its direction",
+                            h == SENSE_LEFT ? "left" : "right");
+                } else {
+                    align_controller(h, yaw_of(head));
+                    if (aligned) axr_log("%s controller recentered", h == SENSE_LEFT ? "left" : "right");
+                }
             }
             ps_down[h] = ps;
         }
@@ -1204,6 +1517,34 @@ static void *status_thread(void *arg) {
                         h == SENSE_LEFT ? "left" : "right", s.bluetooth ? "Bluetooth" : "USB", s.battery * 100,
                         s.charging ? " charging" : "", s.buttons, s.stick[0], s.stick[1], s.trigger, e[0], e[1], e[2],
                         s.updated_ns && axr_now_ns() - (int64_t)s.updated_ns < 1000000000 ? "reporting" : "NOT reporting");
+            }
+            if (g_tracker) {
+                pthread_mutex_lock(&g_lock);
+                unsigned frames = g_stat_track_frames, dots[2] = {g_stat_track_dots[0], g_stat_track_dots[1]},
+                         seen[2] = {g_stat_track_seen[0], g_stat_track_seen[1]},
+                         leds[2] = {g_stat_track_leds[0], g_stat_track_leds[1]};
+                float rms[2] = {g_stat_track_rms[0], g_stat_track_rms[1]};
+                g_stat_track_frames = 0;
+                memset(g_stat_track_dots, 0, sizeof g_stat_track_dots);
+                memset(g_stat_track_seen, 0, sizeof g_stat_track_seen);
+                memset(g_stat_track_leds, 0, sizeof g_stat_track_leds);
+                memset(g_stat_track_rms, 0, sizeof g_stat_track_rms);
+                pthread_mutex_unlock(&g_lock);
+                float cal_rms;
+                int cal = strack_calibration(g_tracker, &cal_rms);
+                char side[2][96];
+                for (int h = 0; h < 2; h++) {
+                    if (seen[h])
+                        snprintf(side[h], sizeof side[h], "seen in %.0f%% of frames (%.1f LEDs, %.2f px)",
+                                 frames ? 100.0 * seen[h] / frames : 0, (double)leds[h] / seen[h], rms[h] / seen[h]);
+                    else
+                        snprintf(side[h], sizeof side[h], "not seen%s",
+                                 sense_leds_on(h) ? "" : " (its LEDs are off: is it connected?)");
+                }
+                axr_log("controller tracking: %.0f camera frames/s, %.1f/%.1f dots a frame (left/right camera);"
+                        " left %s; right %s; cameras calibrated %d times%s",
+                        frames / dt, frames ? (double)dots[0] / frames : 0, frames ? (double)dots[1] / frames : 0, side[0],
+                        side[1], cal, cal ? [NSString stringWithFormat:@" (fit %.2f px)", cal_rms].UTF8String : "");
             }
             if (g_eyes_on) {
                 psvr2_gaze g;
@@ -1305,6 +1646,7 @@ void axr_backend_start(void) {
     }
 
     if (g_cfg.controllers) sense_start();
+    if (g_cfg.controllers && g_cfg.controller_tracking && g_usb) start_controller_tracking();
 
     pthread_t t;
     pthread_create(&t, NULL, status_thread, NULL);

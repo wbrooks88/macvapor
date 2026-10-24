@@ -22,12 +22,12 @@ What works in this first stage:
 - Eye tracking from the headset's own eye tracker: games that ask for eye gaze get it, games that
   render quad views get foveated rendering, and holding Fn for 2 seconds calibrates it (see
   [Eye tracking](#eye-tracking)).
+- The controllers' position, from the headset's two lower cameras watching the controllers'
+  infrared LEDs (see [Controller tracking](#controller-tracking)). Where the cameras can't see a
+  controller (behind your back, above your head) an arm model places it: an elbow at your side
+  and a forearm that turns with the controller. Untested in the headset so far.
 
-Not yet: the controllers' position. Tracking where they are needs the headset's cameras to watch
-their light rings, and no open code does that on a Mac yet. Until then each hand is placed by an
-arm model: an elbow at your side and a forearm that turns with the controller. Pointing, aiming,
-turning a wheel and pressing buttons work; reaching out to grab things only partly does. Room-scale
-position for the head is experimental (see `positional` below).
+Room-scale position for the head is experimental (see `positional` below).
 
 The headset code (USB protocol, lens correction, head tracking) comes from
 [psvr2-player-mac](https://github.com/ttkalec/psvr2-player-mac), which ports it from Monado's
@@ -73,9 +73,10 @@ Once per controller: hold its PS button and Create (left) or Options (right) unt
 blinks, then pick it under System Settings > Bluetooth. After that, pressing PS wakes it and it
 reconnects.
 
-When a game starts, each controller points where your head faces, so hold them pointing forward.
-Press a controller's PS button to point it forward again whenever it drifts; the headset's Fn
-button recenters your view and both controllers at once.
+When a game starts, each controller points where your head faces, so hold them pointing forward
+until the cameras have found them (a second or so in front of you). After that the cameras keep
+them pointing the right way. A controller the cameras can't see drifts slowly; press its PS button
+to point it forward again. The headset's Fn button recenters your view.
 
 ## Build
 
@@ -115,8 +116,11 @@ away: red ahead, green right, blue behind, yellow left. Check:
 - Fn recenters you to face the red pillar.
 - With the controllers on, a cyan ball (left) and a magenta ball (right) sit near your hands, with a
   small white one 20 cm ahead of each. Point a controller around: the white ball should follow
-  where it points. Pull a trigger: its ball lights up and the controller buzzes. If a controller
-  points the wrong way after you press its PS button, send me the log.
+  where it points. Pull a trigger: its ball lights up and the controller buzzes. Hold the
+  controllers out in front of you and move them: the balls should follow your hands, not just turn
+  about your elbows. If they don't, use Capture controllers in MacVapoR (or
+  `psvr2xr-selftest --capture-controllers`), move the controllers around in front of you for 30
+  seconds, and send me the `PS VR2 Controller Capture` folder from your Desktop as a zip, with the log.
 - Both eyes fuse into one 3D picture. If it looks doubled or uncomfortable, close it right away
   and send me the log.
 
@@ -146,6 +150,9 @@ run, and read when a game starts:
 | `chromatic` | true | Per-colour lens correction. |
 | `lookahead_ms` | 0 | Adds to the head prediction. Raise it if the world seems to lag your head when you turn. |
 | `controllers` | true | Use the Sense controllers over Bluetooth. |
+| `controller_tracking` | true | Find the controllers' position with the headset's cameras. Off: the arm model only. |
+| `controller_latency_ms` | 25 | How old a camera frame is when it arrives. Raise it if the hands lag behind when you move them, lower it if they lead. |
+| `controller_threshold` | 170 | How bright (0-255) an LED looks in the camera picture. Lower it if the log says few dots are seen; raise it if lamps or windows are mistaken for LEDs. |
 | `eye_tracking` | true | Use the headset's eye tracker. |
 | `show_gaze` | false | Draw a yellow ring where you look, to check the eye tracker. |
 | `foveated` | true | Offer foveated rendering (quad views) to games that support it. |
@@ -153,6 +160,33 @@ run, and read when a game starts:
 | `foveated_outer_scale` | 0.5 | Resolution of the rest of the view, as a share of `render_scale`'s. |
 | `foveated_inset_scale` | 1.0 | Resolution of the sharp area, as a share of the panel's at its centre. |
 | `positional` | false | Experimental: use the headset's own position tracking instead of the neck model. The axes are a guess; if moving your head moves the world the wrong way, turn it back off and send me the log. |
+
+## Controller tracking
+
+Each Sense controller has 17 infrared LEDs on its ring and grip. While a game runs, MacVapoR keeps
+them lit and reads the headset's two lower cameras over USB (the same pictures passthrough shows),
+60 times a second. In each picture it finds the LEDs as small bright dots and looks for the pose of
+each controller that puts its LEDs on them, starting from the orientation the controller's own
+motion sensor reports, so only where it is and which way it faces about the vertical are unknown.
+Once found, each frame looks near where the controller was. Between camera frames the position is
+carried forward, and the cameras' view of each controller's yaw slowly corrects its motion sensor's
+drift.
+
+Where the cameras sit and how wide their lenses see is a guess to start with (`controller_cameras.json`
+in the config folder). The tracker calibrates it from the frames where it sees a controller well:
+the LEDs' known layout fixes the lens, gravity from the controller's motion sensor fixes each
+camera's tilt, and a controller both cameras see at once ties them together. The calibrated
+cameras are saved back to that file, so the next game starts from them. The log reports it as
+`controller cameras calibrated`.
+
+The 5-second status line reports camera frames per second, how many dots each camera sees, and for
+each controller how often it was seen and how many LEDs were matched. If no dots are seen, the
+cameras may need a lower `controller_threshold`; if a controller is never seen though dots are, the
+camera guess may be too far off: send the capture described under [Step 1: the self-test](#step-1-the-self-test).
+
+The LED layout comes from Monado's PlayStation Sense driver (extracted from Sony's PC driver); the
+way to keep the LEDs lit comes from psvr2-controller-ir-lights-enable, which checked it with a
+camera.
 
 ## Eye tracking
 
@@ -193,7 +227,8 @@ your eyes are open, adjust the headset so it sits level and the IPD dial matches
 the panel composed and repeated, whether the head is tracked, the IPD dial, and raw tracking
 numbers. With the eye tracker on, an `eyes:` line gives its sample rate, where you look, pupil size,
 blinks and the calibration it holds. Each connected controller gets a line too (battery, buttons, stick, trigger, where it
-points), and its calibration is logged when it connects. Send it along with what you saw.
+points), and its calibration is logged when it connects, and a `controller tracking:` line says
+how well the cameras see them. Send it along with what you saw.
 
 ## How it works
 
@@ -207,5 +242,7 @@ queue, so the compositor can show it again on refreshes the game misses.
 `src/sense.c` talks to the Sense controllers through macOS's HID manager. Reading their
 calibration switches them into full reporting; their reports and vibration commands follow
 Monado's PlayStation Sense driver and PSVR2Toolkit. Orientation is fused from each controller's
-gyro and accelerometer, which holds pitch and roll steady; yaw drifts slowly, which the PS button
-fixes.
+gyro and accelerometer, which holds pitch and roll steady; yaw drifts slowly, which the cameras (or
+the PS button) correct. `src/sense_track.c` is the camera tracking: finding the LED dots in the BC4
+camera frames, the pose search and fit, the camera calibration and the smoothing; it needs no Mac,
+and `tests/sense_track_test.c` runs it on made-up frames of both controllers.

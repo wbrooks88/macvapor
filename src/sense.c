@@ -30,7 +30,11 @@ enum { SONY = 0x054C, PID_LEFT = 0x0E45, PID_RIGHT = 0x0E46 };
 enum { BT_INPUT_ID = 0x31, BT_INPUT_LEN = 78, USB_INPUT_ID = 0x01, USB_INPUT_LEN = 64 };
 enum { BT_OUTPUT_ID = 0x31, BT_OUTPUT_LEN = 78, USB_OUTPUT_LEN = 39, OUTPUT_TAG = 0x10 };
 enum { CALIB_ID = 0x05, FEATURE_LEN = 64, CALIB_LEN = 116 };
-enum { LED_ALL_OFF = 5 };
+enum { LED_PRESCAN = 1, LED_ALL_OFF = 5 };
+// The tracking LEDs lit steadily, as psvr2-controller-ir-lights-enable (MIT) found works and checked
+// with a camera: PRESCAN pulses of period 42 (42 x 150 ticks of a third of a microsecond, 2.1 ms)
+// every 2 ms, so each overlaps the next, starting 50 ms after the controller's clock now reads.
+enum { LED_STEADY_PERIOD = 42, LED_STEADY_CYCLE = 2000000 * 3, LED_LEAD_TICKS = 50000 * 3 };
 enum { VIBRATE_ENABLE = 0x03, VIBRATE_HIGH_120HZ = 0x00, VIBRATE_LOW_60HZ = 0x20, VIBRATE_CLASSIC = 0x40 };
 static const int64_t OUTPUT_PERIOD_NS = 10666666;   // 32 samples at 3000 Hz
 
@@ -53,6 +57,14 @@ typedef struct {
     // Output.
     uint8_t out_seq, out_counter;
     uint8_t vib_amplitude, vib_mode;
+    // The tracking LEDs: the controller's clock as last read (Monado's device_timestamp_ticks,
+    // thirds of a microsecond) and when; the LED settings' sequence number, bumped on each change;
+    // and the pulses' start, fixed when they were turned on.
+    uint32_t device_ticks;
+    int64_t device_ticks_ns;
+    bool leds_on;
+    uint8_t led_seq;
+    uint32_t led_start;
     int64_t vib_end_ns;
     bool vib_dirty;
     unsigned crc_errors, reports;
@@ -63,6 +75,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static controller g_ctl[2];
 static uint64_t g_generation;
 static bool g_started;
+static bool g_leds_wanted;
 
 static int64_t now_ns(void) {
     struct timespec ts;
@@ -247,6 +260,8 @@ static void handle_report(controller *c, int hand, const uint8_t *r, CFIndex len
     s->battery = charge_state == 2 ? 1.0f : charge_state <= 1 ? fminf(1.0f, (bat & 15) * 0.1f + 0.05f) : -1;
     s->charging = charge_state == 1 || charge_state == 2;
 
+    c->device_ticks = le32(p + 47);
+    c->device_ticks_ns = t;
     uint32_t ticks = le32(p + 27);   // thirds of a microsecond
     if (c->calibrated) {
         float gyro[3], accel[3];
@@ -292,7 +307,22 @@ static void fill_settings(controller *c, uint8_t *s, int64_t t) {
         c->vib_dirty = c->vib_amplitude != 0;   // keep restating it while it runs, then once at 0
     }
     put32(s + 15, (uint32_t)(t / 1000));        // host time of sending, microseconds
-    s[19] = LED_ALL_OFF;                        // tracking LEDs off: nothing here watches them
+    // The tracking LEDs (Monado's struct pssense_led_settings at byte 19): on steadily while the
+    // headset's cameras look for them, off otherwise.
+    bool on = g_leds_wanted && c->device_ticks_ns;
+    if (on != c->leds_on) {
+        c->leds_on = on;
+        c->led_seq++;
+        if (on) c->led_start = c->device_ticks + (uint32_t)((t - c->device_ticks_ns) * 3 / 1000) + LED_LEAD_TICKS;
+    }
+    s[19] = on ? LED_PRESCAN : LED_ALL_OFF;
+    s[20] = c->led_seq;
+    if (on) {
+        s[21] = LED_STEADY_PERIOD;
+        put32(s + 22, c->led_start);
+        put32(s + 26, LED_STEADY_CYCLE);
+        memset(s + 30, 0xff, 4);                // every LED of the four groups
+    }
 }
 
 // The next output report, in r; returns its length. Called under g_lock.
@@ -471,6 +501,20 @@ uint64_t sense_generation(void) {
     uint64_t g = g_generation;
     pthread_mutex_unlock(&g_lock);
     return g;
+}
+
+void sense_tracking_leds(bool on) {
+    pthread_mutex_lock(&g_lock);
+    g_leds_wanted = on;
+    pthread_mutex_unlock(&g_lock);
+}
+
+bool sense_leds_on(int hand) {
+    if (hand != SENSE_LEFT && hand != SENSE_RIGHT) return false;
+    pthread_mutex_lock(&g_lock);
+    bool on = g_ctl[hand].leds_on;
+    pthread_mutex_unlock(&g_lock);
+    return on;
 }
 
 void sense_vibrate(int hand, float seconds, float frequency, float amplitude) {

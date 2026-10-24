@@ -43,7 +43,8 @@ for f in cpsvr2 fusion lut; do
     clang $cflags -I "$BREW/include/libusb-1.0" -c "$here/src/psvr2/$f.c" -o "$here/build/$f.o"
 done
 clang $cflags -c "$here/src/sense.c" -o "$here/build/sense.o"   # the Sense controllers
-core="$here/build/cpsvr2.o $here/build/fusion.o $here/build/lut.o $here/build/sense.o"
+clang $cflags -c "$here/src/sense_track.c" -o "$here/build/sense_track.o"   # and the cameras finding them
+core="$here/build/cpsvr2.o $here/build/fusion.o $here/build/lut.o $here/build/sense.o $here/build/sense_track.o"
 frameworks="-framework Foundation -framework AppKit -framework Metal -framework QuartzCore -framework CoreVideo -framework CoreGraphics -framework IOKit"
 
 # shellcheck disable=SC2086

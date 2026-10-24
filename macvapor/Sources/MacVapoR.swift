@@ -99,6 +99,7 @@ enum PSVR2 {
         var reprojection = true
         var positional = false
         var controllers = true
+        var controllerTracking = true
         var eyeTracking = true
         var showGaze = false
         var foveated = true
@@ -106,6 +107,8 @@ enum PSVR2 {
         var foveatedAreaDeg = 40.0
         var foveatedOuterScale = 0.5
         var foveatedInsetScale = 1.0
+        var controllerLatencyMs = 25.0
+        var controllerThreshold = 170.0
 
         static func load() -> Settings {
             var s = Settings()
@@ -118,6 +121,9 @@ enum PSVR2 {
             s.reprojection = c["reprojection"] as? Bool ?? s.reprojection
             s.positional = c["positional"] as? Bool ?? s.positional
             s.controllers = c["controllers"] as? Bool ?? s.controllers
+            s.controllerTracking = c["controller_tracking"] as? Bool ?? s.controllerTracking
+            s.controllerLatencyMs = c["controller_latency_ms"] as? Double ?? s.controllerLatencyMs
+            s.controllerThreshold = c["controller_threshold"] as? Double ?? s.controllerThreshold
             s.eyeTracking = c["eye_tracking"] as? Bool ?? s.eyeTracking
             s.showGaze = c["show_gaze"] as? Bool ?? s.showGaze
             s.foveated = c["foveated"] as? Bool ?? s.foveated
@@ -132,7 +138,9 @@ enum PSVR2 {
                                     "chromatic": chromatic, "reprojection": reprojection, "positional": positional,
                                     "controllers": controllers, "eye_tracking": eyeTracking, "show_gaze": showGaze,
                                     "foveated": foveated, "foveated_area_deg": foveatedAreaDeg,
-                                    "foveated_outer_scale": foveatedOuterScale, "foveated_inset_scale": foveatedInsetScale]
+                                    "foveated_outer_scale": foveatedOuterScale, "foveated_inset_scale": foveatedInsetScale,
+                                    "controller_tracking": controllerTracking, "controller_latency_ms": controllerLatencyMs,
+                                    "controller_threshold": controllerThreshold]
             try? FileManager.default.createDirectory(at: Paths.psvr2Config.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let out = try? JSONSerialization.data(withJSONObject: c, options: [.prettyPrinted, .sortedKeys]) {
                 try? out.write(to: Paths.psvr2Config, options: .atomic)
@@ -425,7 +433,7 @@ final class Model: ObservableObject {
         output = "Starting \(game.name) through Steam." + (notes.isEmpty ? "" : " Note: " + notes.joined(separator: "; ") + ".")
     }
 
-    enum SelftestMode { case normal, slow, calibrateEyes, foveated }
+    enum SelftestMode { case normal, slow, calibrateEyes, foveated, captureControllers }
 
     func startSelftest(_ mode: SelftestMode) {
         guard selftest == nil else { return }
@@ -436,6 +444,7 @@ final class Model: ObservableObject {
         case .slow: p.arguments = ["--slow", "2"]
         case .calibrateEyes: p.arguments = ["--calibrate-eyes"]
         case .foveated: p.arguments = ["--foveated"]
+        case .captureControllers: p.arguments = ["--capture-controllers"]
         }
         p.terminationHandler = { _ in Task { @MainActor in self.selftest = nil } }
         do {
@@ -446,6 +455,8 @@ final class Model: ObservableObject {
                 output = "Eye calibration: put the headset on and look at each dot until the next one appears (13 dots, about a minute). Press Stop when the test room comes back."
             case .foveated:
                 output = "Foveated test: the test room, with the sharp area tinted orange. It should follow your eyes, with a yellow ring where you look."
+            case .captureControllers:
+                output = "Controller capture: the test room, while camera frames are saved to the PS VR2 Controller Capture folder on your Desktop. Hold both controllers in front of you and move them around slowly for 30 seconds, then press Stop and send Claude that folder as a zip."
             default:
                 output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
             }
@@ -889,6 +900,13 @@ struct ContentView: View {
                         Button("Foveated test") { model.startSelftest(.foveated) }
                     }
                 }
+                HStack {
+                    Text("Controller tracking: the balls in the test room should follow your hands. If they don't, capture what the cameras see.").foregroundStyle(.secondary)
+                    Spacer()
+                    if model.selftest == nil {
+                        Button("Capture controllers") { model.startSelftest(.captureControllers) }
+                    }
+                }
                 Divider()
                 HStack {
                     Text("Render scale")
@@ -910,6 +928,8 @@ struct ContentView: View {
                 Toggle("Per-colour lens correction", isOn: $model.psvr2Settings.chromatic)
                 Toggle("Room-scale position (experimental)", isOn: $model.psvr2Settings.positional)
                 Toggle("Sense controllers", isOn: $model.psvr2Settings.controllers)
+                Toggle("Track controller position with the headset cameras", isOn: $model.psvr2Settings.controllerTracking)
+                    .disabled(!model.psvr2Settings.controllers)
                 Toggle("Eye tracking", isOn: $model.psvr2Settings.eyeTracking)
                 Toggle("Show where I look (a yellow ring)", isOn: $model.psvr2Settings.showGaze)
                 Toggle("Foveated rendering, in games that support it (quad views)", isOn: $model.psvr2Settings.foveated)

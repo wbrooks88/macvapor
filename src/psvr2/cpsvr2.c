@@ -91,6 +91,12 @@ static volatile int g_camera_running;
 static unsigned char *g_camera_frame; /* two BC4 planes back to back */
 static int g_camera_seq;              /* grows with every received frame */
 static int g_camera_seq_taken;
+/* The cameras run while anyone wants them: passthrough, controller tracking or both */
+static pthread_mutex_t g_camera_ctl = PTHREAD_MUTEX_INITIALIZER;
+static int g_camera_users;
+static psvr2_camera_listener g_camera_listener;
+static void *g_camera_listener_ctx;
+static void camera_off(void);
 
 /* Gyro integration corrected toward SLAM poses (see fusion.c) */
 #define IMU_DT 0.0005f
@@ -334,7 +340,10 @@ void psvr2_stop(void)
 	}
 	/* The camera and gaze threads use g_dev — shut them down before closing the
 	 * device, also powering off the headset cameras and eye tracker */
-	psvr2_camera_stop();
+	pthread_mutex_lock(&g_camera_ctl);
+	g_camera_users = 0;
+	camera_off();
+	pthread_mutex_unlock(&g_camera_ctl);
 	psvr2_gaze_stop();
 	g_running = 0;
 	pthread_join(g_slam_thread, NULL);
@@ -454,23 +463,26 @@ static void *camera_thread_fn(void *arg)
 			continue;
 		}
 
+		double arrived = monotonic_s();
 		pthread_mutex_lock(&g_camera_lock);
 		if (g_camera_frame != NULL) {
 			memcpy(g_camera_frame, buf + CAMERA_HEADER_BYTES, 2 * PSVR2_CAM_PLANE_BYTES);
 			g_camera_seq++;
 		}
+		psvr2_camera_listener fn = g_camera_listener;
+		void *ctx = g_camera_listener_ctx;
 		pthread_mutex_unlock(&g_camera_lock);
+		if (fn != NULL) {
+			fn(buf, buf + CAMERA_HEADER_BYTES, buf + CAMERA_HEADER_BYTES + PSVR2_CAM_PLANE_BYTES, arrived, ctx);
+		}
 	}
 
 	free(buf);
 	return NULL;
 }
 
-int psvr2_camera_start(void)
+static int camera_on(void)
 {
-	if (g_dev == NULL) {
-		return -1;
-	}
 	if (g_camera_running) {
 		return 0;
 	}
@@ -507,7 +519,7 @@ int psvr2_camera_start(void)
 	return 0;
 }
 
-void psvr2_camera_stop(void)
+static void camera_off(void)
 {
 	if (!g_camera_running) {
 		return;
@@ -516,6 +528,37 @@ void psvr2_camera_stop(void)
 	pthread_join(g_camera_thread, NULL);
 	camera_power(0);
 	libusb_release_interface(g_dev, CAMERA_INTERFACE);
+}
+
+int psvr2_camera_start(void)
+{
+	if (g_dev == NULL) {
+		return -1;
+	}
+	pthread_mutex_lock(&g_camera_ctl);
+	int ret = camera_on();
+	if (ret == 0) {
+		g_camera_users++;
+	}
+	pthread_mutex_unlock(&g_camera_ctl);
+	return ret;
+}
+
+void psvr2_camera_stop(void)
+{
+	pthread_mutex_lock(&g_camera_ctl);
+	if (g_camera_users > 0 && --g_camera_users == 0) {
+		camera_off();
+	}
+	pthread_mutex_unlock(&g_camera_ctl);
+}
+
+void psvr2_camera_set_listener(psvr2_camera_listener fn, void *ctx)
+{
+	pthread_mutex_lock(&g_camera_lock);
+	g_camera_listener = fn;
+	g_camera_listener_ctx = ctx;
+	pthread_mutex_unlock(&g_camera_lock);
 }
 
 int psvr2_camera_get_frame(unsigned char *left, unsigned char *right)

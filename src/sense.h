@@ -3,8 +3,9 @@
 // vibration. The protocol (report layouts, CRCs, calibration) follows Monado's pssense driver
 // (BSL-1.0, by Jarett Millard and others) and PSVR2Toolkit (MIT); see src/sense.c.
 //
-// Orientation only: the controllers' position needs the headset's cameras to see their LED rings,
-// which no open code does on a Mac yet. backend_psvr2.m places them with an arm model.
+// Orientation from here; position from the headset's cameras seeing the LED rings, which
+// sense_tracking_leds() lights (sense_track.c finds them). backend_psvr2.m places a controller the
+// cameras can't see with an arm model.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -50,3 +51,6 @@ void sense_start(void);                       // idempotent; finds controllers a
 bool sense_get(int hand, sense_state *out);   // false if that controller isn't connected
 uint64_t sense_generation(void);              // bumps on every input report
 void sense_vibrate(int hand, float seconds, float frequency, float amplitude);
+// The infrared tracking LEDs, steadily on or off (off by default: they show in passthrough).
+void sense_tracking_leds(bool on);
+bool sense_leds_on(int hand);       // the last output report to that controller asked for them on

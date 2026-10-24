@@ -58,10 +58,18 @@ const float *psvr2_distortion_lut(void);
 /* BC4: 4 bits per pixel */
 #define PSVR2_CAM_PLANE_BYTES (PSVR2_CAM_WIDTH * PSVR2_CAM_HEIGHT / 2)
 
-/* Powers on the cameras and starts the read thread. 0 — success. */
+/* Powers on the cameras and starts the read thread. 0 — success. Counted: passthrough and
+ * controller tracking each start and stop them, and they stay on while either wants them. */
 int psvr2_camera_start(void);
 
 void psvr2_camera_stop(void);
+
+/* Called on the camera thread with every frame as it arrives: the packet's 256-byte header, the
+ * two BC4 planes (left camera, right camera; PSVR2_CAM_PLANE_BYTES each, 256 blocks to a row), and
+ * the CLOCK_MONOTONIC second it arrived. The planes are only valid during the call. NULL stops it. */
+typedef void (*psvr2_camera_listener)(const unsigned char *header, const unsigned char *left,
+                                      const unsigned char *right, double arrived_s, void *ctx);
+void psvr2_camera_set_listener(psvr2_camera_listener fn, void *ctx);
 
 /* Copies the last frame: left and right are PSVR2_CAM_PLANE_BYTES buffers each.
  * Returns 1 if the frame is new (since the previous call), 0 otherwise. */

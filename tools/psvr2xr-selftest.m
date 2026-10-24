@@ -11,6 +11,9 @@
 //   out/psvr2xr-selftest --foveated       render quad views as a foveated game would: a low-
 //                                   resolution room with a sharp inset, tinted orange, that
 //                                   follows your eyes; a yellow ring shows where you look
+//   out/psvr2xr-selftest --capture-controllers   the room, while saving what controller tracking
+//                                   sees (camera frames, dots, poses) to ~/Desktop/PS VR2 Controller
+//                                   Capture, to send for a look when the controllers aren't found
 //
 // The room: a floor grid with 1 m squares, a horizon, and four pillars 3 m away: red ahead,
 // green to the right, blue behind and yellow to the left. Straight grid lines and a level horizon
@@ -18,8 +21,9 @@
 //
 // Sense controllers, when connected over Bluetooth, show as a ball at each hand (cyan left,
 // magenta right) with a smaller one 20 cm along where the controller points; the trigger lights the
-// ball up and vibrates the controller. Each points where your head faces when it connects; press
-// its PS button to point it forward again.
+// ball up and vibrates the controller. Where the headset's cameras see them, the balls follow your
+// hands; elsewhere an arm model places them. Each points where your head faces when it connects
+// until the cameras find it; press its PS button to point it forward again.
 #import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #include <pthread.h>
@@ -203,6 +207,11 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "--shaders-only")) g_shaders_only = true;
             else if (!strcmp(argv[i], "--calibrate-eyes")) g_calibrate_eyes = true;
             else if (!strcmp(argv[i], "--foveated")) g_foveated = true;
+            else if (!strcmp(argv[i], "--capture-controllers")) {
+                NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Desktop/PS VR2 Controller Capture"];
+                setenv("PSVR2XR_CAPTURE_DIR", dir.fileSystemRepresentation, 1);
+                printf("Saving what controller tracking sees to %s\n", dir.fileSystemRepresentation);
+            }
         if (g_shaders_only) {
             id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
             if (!dev) { puts("no Metal device; shader not checked"); return 0; }
