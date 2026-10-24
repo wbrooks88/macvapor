@@ -39,9 +39,9 @@ typedef struct {
     bool off;               // not used (no model of it yet)
 } strack_camera;
 
-// The cameras: the lower pair as fitted to a capture from a real headset, at the front corners of
-// the visor, turned about 12 degrees out and 28 down, seeing about 150 degrees across; the upper
-// pair a guess, off.
+// The cameras as fitted to captures from a real headset: the lower pair at the front corners of
+// the visor, turned about 12 degrees out and 28 down, the upper pair 30 out and 10 up, each seeing
+// about 150 degrees across.
 void strack_default_cameras(strack_camera out[STRACK_CAMERAS]);
 
 typedef struct {

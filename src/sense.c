@@ -62,9 +62,17 @@ typedef struct {
     // and the pulses' start, fixed when they were turned on.
     uint32_t device_ticks;
     int64_t device_ticks_ns;
+    // The controller's clock against ours: its ticks unwrapped, and the latest of (its time - our
+    // time) over the last reports, the ones that came quickest.
+    int64_t ticks64;
+    int64_t clock_off[64];
+    int clock_n;
     bool leds_on;
     uint8_t led_seq;
     uint32_t led_start;
+    // Flashing in time with the headset's cameras: the blink centre last sent, in its ticks.
+    bool synced;
+    int64_t sent_centre_ns;
     int64_t vib_end_ns;
     bool vib_dirty;
     unsigned crc_errors, reports;
@@ -76,6 +84,9 @@ static controller g_ctl[2];
 static uint64_t g_generation;
 static bool g_started;
 static bool g_leds_wanted;
+// The headset's camera exposures, for flashing in time with them: one exposure's centre (our clock),
+// the period, and where in the period to flash, found by trying.
+static int64_t g_expose_ns, g_expose_period_ns, g_flash_shift_ns;
 
 static int64_t now_ns(void) {
     struct timespec ts;
@@ -260,8 +271,12 @@ static void handle_report(controller *c, int hand, const uint8_t *r, CFIndex len
     s->battery = charge_state == 2 ? 1.0f : charge_state <= 1 ? fminf(1.0f, (bat & 15) * 0.1f + 0.05f) : -1;
     s->charging = charge_state == 1 || charge_state == 2;
 
-    c->device_ticks = le32(p + 47);
+    uint32_t dt_ticks = le32(p + 47);
+    if (c->device_ticks_ns) c->ticks64 += (uint32_t)(dt_ticks - c->device_ticks);
+    else c->ticks64 = dt_ticks;
+    c->device_ticks = dt_ticks;
     c->device_ticks_ns = t;
+    c->clock_off[c->clock_n++ % 64] = c->ticks64 * 1000 / 3 - t;
     uint32_t ticks = le32(p + 27);   // thirds of a microsecond
     if (c->calibrated) {
         float gyro[3], accel[3];
@@ -299,6 +314,15 @@ static void input_callback(void *ctx, IOReturn result, void *sender, IOHIDReport
 // ---------------------------------------------------------------------------------------- output
 
 // The 38 bytes of settings that both report forms carry (Monado's struct pssense_output_settings).
+// Our time t in the controller's ticks: its clock as the quickest of the last reports put it.
+static uint32_t device_ticks_at(const controller *c, int64_t t) {
+    int n = c->clock_n < 64 ? c->clock_n : 64;
+    int64_t off = INT64_MIN;
+    for (int i = 0; i < n; i++)
+        if (c->clock_off[i] > off) off = c->clock_off[i];
+    return (uint32_t)((t + off) * 3 / 1000);
+}
+
 static void fill_settings(controller *c, uint8_t *s, int64_t t) {
     if (c->vib_amplitude && t >= c->vib_end_ns) { c->vib_amplitude = 0; c->vib_dirty = true; }
     if (c->vib_dirty) {
@@ -307,17 +331,49 @@ static void fill_settings(controller *c, uint8_t *s, int64_t t) {
         c->vib_dirty = c->vib_amplitude != 0;   // keep restating it while it runs, then once at 0
     }
     put32(s + 15, (uint32_t)(t / 1000));        // host time of sending, microseconds
-    // The tracking LEDs (Monado's struct pssense_led_settings at byte 19): on steadily while the
-    // headset's cameras look for them, off otherwise.
+    // The tracking LEDs (Monado's struct pssense_led_settings at byte 19): on while the headset's
+    // cameras look for them, off otherwise. Without the cameras' timing, PRESCAN pulses of 2.1 ms
+    // every 2 ms, which look steady to the passthrough cameras but come out as each controller in
+    // turn to the short exposures of the tracking mode; with it, one 2.1 ms flash on each exposure,
+    // as Monado's driver does, both controllers in every frame.
     bool on = g_leds_wanted && c->device_ticks_ns;
+    bool sync = on && g_expose_period_ns > 0 && c->clock_n >= 16;
+    int64_t centre = 0;
+    if (sync) {
+        int64_t at = g_expose_ns + g_flash_shift_ns;
+        at += ((t - at) / g_expose_period_ns + 1) * g_expose_period_ns;   // the next one
+        centre = at;
+        // Resent when it has moved by a fifth of a millisecond from what the controller is doing.
+        int64_t drift = c->synced ? (centre - c->sent_centre_ns) % g_expose_period_ns : INT64_MAX;
+        if (drift > g_expose_period_ns / 2) drift -= g_expose_period_ns;
+        if (drift < -g_expose_period_ns / 2) drift += g_expose_period_ns;
+        if (!c->synced || llabs(drift) > 200000) {
+            c->led_seq++;
+            c->sent_centre_ns = centre;
+            c->synced = true;
+        } else {
+            centre = c->sent_centre_ns;
+        }
+    } else if (c->synced) {
+        c->synced = false;
+        c->led_seq++;
+    }
     if (on != c->leds_on) {
         c->leds_on = on;
+        // A new sequence number tells the controller the settings changed; one this process hasn't
+        // used, since the last process may have left it on the number this one would start at.
+        if (!c->led_seq) c->led_seq = (uint8_t)(arc4random() | 1);
         c->led_seq++;
         if (on) c->led_start = c->device_ticks + (uint32_t)((t - c->device_ticks_ns) * 3 / 1000) + LED_LEAD_TICKS;
     }
     s[19] = on ? LED_PRESCAN : LED_ALL_OFF;
     s[20] = c->led_seq;
-    if (on) {
+    if (on && sync) {
+        s[21] = LED_STEADY_PERIOD;
+        put32(s + 22, device_ticks_at(c, centre));
+        put32(s + 26, (uint32_t)(g_expose_period_ns * 3));
+        memset(s + 30, 0xff, 4);
+    } else if (on) {
         s[21] = LED_STEADY_PERIOD;
         put32(s + 22, c->led_start);
         put32(s + 26, LED_STEADY_CYCLE);
@@ -506,6 +562,14 @@ uint64_t sense_generation(void) {
 void sense_tracking_leds(bool on) {
     pthread_mutex_lock(&g_lock);
     g_leds_wanted = on;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void sense_led_timing(int64_t exposure_ns, int64_t period_ns, int64_t shift_ns) {
+    pthread_mutex_lock(&g_lock);
+    g_expose_ns = exposure_ns;
+    g_expose_period_ns = period_ns;
+    g_flash_shift_ns = shift_ns;
     pthread_mutex_unlock(&g_lock);
 }
 

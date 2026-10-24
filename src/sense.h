@@ -53,4 +53,8 @@ uint64_t sense_generation(void);              // bumps on every input report
 void sense_vibrate(int hand, float seconds, float frequency, float amplitude);
 // The infrared tracking LEDs, steadily on or off (off by default: they show in passthrough).
 void sense_tracking_leds(bool on);
-bool sense_leds_on(int hand);       // the last output report to that controller asked for them on
+bool sense_leds_on(int hand);
+// The headset's camera exposures (one's centre on CLOCK_MONOTONIC in ns, and the period): the
+// tracking LEDs then flash once on each, shift_ns after it (the unknown latencies, found by trying).
+// A period of 0 goes back to steady pulses.
+void sense_led_timing(int64_t exposure_ns, int64_t period_ns, int64_t shift_ns);       // the last output report to that controller asked for them on

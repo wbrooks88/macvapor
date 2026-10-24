@@ -526,6 +526,7 @@ static float g_stat_track_rms[2];
 static void camera_frame(const unsigned char *header, const unsigned char *left, const unsigned char *right,
                          double arrived_s, void *ctx) {
     (void)ctx;
+    sense_led_timing(0, 0, 0);   // the passthrough mode's long exposures see steady pulses
     pthread_mutex_lock(&g_track_lock);
     memcpy(g_track_planes[0], left, PSVR2_CAM_PLANE_BYTES);
     memcpy(g_track_planes[1], right, PSVR2_CAM_PLANE_BYTES);
@@ -537,11 +538,45 @@ static void camera_frame(const unsigned char *header, const unsigned char *left,
     pthread_mutex_unlock(&g_track_lock);
 }
 
+// The controllers' LEDs flash once on each exposure of the tracking mode (sense_led_timing). The
+// headers carry the exposure time in the headset's microseconds (bytes 8 to 11, 16683 apart); the
+// quickest arrival over the last couple of seconds ties that to our clock, and where in the frame
+// to flash, for the latencies in between, tracking_thread finds by trying (g_led_shift_ns).
+static int64_t g_expose_us64, g_expose_arrival_off[128];
+static uint32_t g_expose_last_us;
+static int g_expose_n;
+static double g_expose_period_us = 16683;
+static _Atomic int64_t g_led_shift_ns = -1;   // -1: not searched yet
+
+static void led_timing(const unsigned char *header, double arrived_s) {
+    uint32_t us = (uint32_t)header[8] | (uint32_t)header[9] << 8 | (uint32_t)header[10] << 16 | (uint32_t)header[11] << 24;
+    uint32_t d = us - g_expose_last_us;
+    if (g_expose_n && d > 5000 && d < 100000) {
+        g_expose_us64 += d;
+        double frames = round(d / g_expose_period_us);
+        if (frames >= 1) g_expose_period_us += 0.02 * (d / frames - g_expose_period_us);
+    } else {
+        g_expose_us64 = us;   // the first, or a jump: start again
+        g_expose_n = 0;
+    }
+    g_expose_last_us = us;
+    int64_t arrival = (int64_t)(arrived_s * 1e9);
+    g_expose_arrival_off[g_expose_n++ % 128] = arrival - g_expose_us64 * 1000;
+    int n = g_expose_n < 128 ? g_expose_n : 128;
+    int64_t off = INT64_MAX;
+    for (int i = 0; i < n; i++)
+        if (g_expose_arrival_off[i] < off) off = g_expose_arrival_off[i];
+    int64_t shift = g_led_shift_ns;
+    if (n >= 30 && shift >= 0)
+        sense_led_timing(g_expose_us64 * 1000 + off, (int64_t)(g_expose_period_us * 1000), shift);
+}
+
 // The two pairs come one after the other with the same exposure time in their headers (bytes 8 to
 // 11); both go to the tracker together. An upper pair without its lower one goes alone.
 static void tracking_frame(const unsigned char *header, int upper, const unsigned char *left,
                            const unsigned char *right, double arrived_s, void *ctx) {
     (void)ctx;
+    if (!upper) led_timing(header, arrived_s);
     pthread_mutex_lock(&g_track_lock);
     if (!upper) {
         memcpy(g_lower_wait[0], left, PSVR2_TRACK_PICTURE_BYTES);
@@ -636,7 +671,10 @@ static unsigned g_capture_frames, g_capture_saved;
 static void capture_frame(bool half, const unsigned char *header, unsigned char *const planes[2],
                           unsigned char headers[2][256], unsigned char *const pictures[STRACK_CAMERAS],
                           const bool has[STRACK_CAMERAS], const strack_input *in, const strack_result r[2]) {
-    if (!g_capture || g_capture_saved >= 300 || g_capture_frames++ % 4) return;
+    static int every;
+    if (!every) every = getenv("PSVR2XR_CAPTURE_EVERY") ? atoi(getenv("PSVR2XR_CAPTURE_EVERY")) : 4;
+    if (every < 1) every = 1;
+    if (!g_capture || g_capture_saved >= 300 || g_capture_frames++ % every) return;
     NSString *name = [NSString stringWithFormat:half ? @"frame_%03u.m4" : @"frame_%03u.bin", g_capture_saved++];
     FILE *f = fopen([g_capture_dir stringByAppendingPathComponent:name].fileSystemRepresentation, "wb");
     if (f && !half) {
@@ -679,6 +717,71 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
     fprintf(g_capture, "}\n");
     fflush(g_capture);
     if (g_capture_saved == 300) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
+}
+
+// Finds where in the frame the LEDs must flash to be in the pictures: each shift in turn (1.5 ms
+// apart, the flash being 2.1 ms long) for a few frames, counting the dots; the most dots win, then
+// half a step either side. Searched again when the dots fall away for a while.
+static void led_search(int dots) {
+    enum { STEP_NS = 1500000, SETTLE = 4, COUNT = 6 };
+    static int step = -1, nsteps, frame, refine;
+    static double sum, means[16], best, dark, level;
+    static int64_t base, coarse, last_search_ns;
+    static int recent_n;
+    static double recent;
+    int64_t period = (int64_t)(g_expose_period_us * 1000);
+    if (step < 0 && g_led_shift_ns >= 0) {
+        // Locked: watch the level.
+        recent += dots;
+        if (++recent_n < 120) return;
+        double mean = recent / recent_n;
+        recent = 0;
+        recent_n = 0;
+        if (mean > dark + 0.5 * (level - dark) || axr_now_ns() - last_search_ns < 5000000000LL) return;
+        axr_log("controller LEDs: %.1f dots a frame, was %.1f; finding their timing again", mean, level);
+    }
+    if (step < 0) {   // start
+        nsteps = (int)(period / STEP_NS);
+        if (nsteps > 16) nsteps = 16;
+        step = 0; frame = 0; sum = 0; refine = 0; base = 0;
+        last_search_ns = axr_now_ns();
+        g_led_shift_ns = 0;
+        return;
+    }
+    if (++frame <= SETTLE) return;
+    sum += dots;
+    if (frame < SETTLE + COUNT) return;
+    double mean = sum / COUNT;
+    frame = 0;
+    sum = 0;
+    if (!refine) {
+        means[step] = mean;
+        if (++step < nsteps) { g_led_shift_ns = (int64_t)step * STEP_NS; return; }
+        int b = 0;
+        dark = means[0];
+        for (int i = 1; i < nsteps; i++) {
+            if (means[i] > means[b]) b = i;
+            if (means[i] < dark) dark = means[i];
+        }
+        best = means[b];
+        base = coarse = (int64_t)b * STEP_NS;
+        refine = 1;
+        g_led_shift_ns = (coarse - STEP_NS / 2 + period) % period;
+        return;
+    }
+    if (mean > best) { best = mean; base = g_led_shift_ns; }
+    if (refine == 1) {
+        refine = 2;
+        g_led_shift_ns = (coarse + STEP_NS / 2) % period;
+        return;
+    }
+    g_led_shift_ns = base;
+    level = best;
+    step = -1;
+    recent = 0;
+    recent_n = 0;
+    axr_log("controller LEDs: flashing %.1f ms into each %.2f ms frame (%.1f dots a frame there, %.1f at the worst)",
+            base / 1e6, period / 1e6, best, dark);
 }
 
 static void *tracking_thread(void *arg) {
@@ -724,6 +827,7 @@ static void *tracking_thread(void *arg) {
             else
                 strack_no_picture(g_tracker, c);
         }
+        if (half) led_search(dots[0] + dots[1] + dots[2] + dots[3]);
 
         // The head then, and each controller's orientation from its IMU.
         strack_input in = {.time_ns = exposed};

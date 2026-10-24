@@ -11,7 +11,7 @@
 #define DEG (PI_F / 180)
 #define RING_LEVEL 0.6f   // of the threshold: what counts as bright around a dot
 
-enum { FRAME_W = 1024, FRAME_H = 1016, ALL_CAMS = (1 << STRACK_CAMERAS) - 1, STACK_CAP = FRAME_W * 8, MAX_MATCHES = 2 * STRACK_LEDS, MAX_PAIRS = 128, HYPOTHESES = 6 };
+enum { FRAME_W = 1024, FRAME_H = 1016, ALL_CAMS = (1 << STRACK_CAMERAS) - 1, STACK_CAP = FRAME_W * 8, MAX_MATCHES = STRACK_CAMERAS * STRACK_LEDS, MAX_PAIRS = 128, HYPOTHESES = 6 };
 
 // ------------------------------------------------------------------------------------ LED model
 //
@@ -177,21 +177,22 @@ void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
     // The lower pair fitted to a capture from a real headset (both controllers moving in front of
     // the wearer, 60 frames): the turn, centre and focal length that make the two cameras agree on
     // where each controller is (to about a centimetre) and put the most LEDs on dots. The lenses
-    // are toed in by roll as well as yaw, and look about 28 degrees down. The upper pair is only a
-    // guess, the lower pair's mirror image, and stays off until fitted.
+    // are toed in by roll as well as yaw, and look about 28 degrees down. The upper pair fitted to
+    // the LEDs of controllers the lower pair saw well (tests/fit_upper_cameras.c): turned 30
+    // degrees out, 10 up, and rolled about 28 the other way.
     static const float k[STRACK_CAMERAS][5] = {
         // cx, cy, yaw, pitch, roll
         {509.6f, 478.0f, 12.8f, -26.0f, -6.8f},
         {500.5f, 508.0f, -11.0f, -30.0f, 6.4f},
-        {508.0f, 508.0f, 15.0f, 28.0f, 6.0f},
-        {508.0f, 508.0f, -15.0f, 28.0f, -6.0f},
+        {503.3f, 516.4f, 30.4f, 12.0f, -31.4f},
+        {507.4f, 510.5f, -29.9f, 8.0f, 24.8f},
     };
     for (int i = 0; i < STRACK_CAMERAS; i++) {
         float side = i % 2 == 0 ? -1 : 1, up = i >= 2 ? 1 : -1;
         out[i] = (strack_camera){
             .f = 410.5f, .cx = k[i][0], .cy = k[i][1], .k = {0.03f, 0, 0, 0}, .max_angle_deg = 78,
             .width = 1016, .height = 1016, .position = {side * 0.060f, up * 0.030f, -0.102f},
-            .yaw_deg = k[i][2], .pitch_deg = k[i][3], .roll_deg = k[i][4], .off = i >= 2,
+            .yaw_deg = k[i][2], .pitch_deg = k[i][3], .roll_deg = k[i][4],
         };
     }
 }
