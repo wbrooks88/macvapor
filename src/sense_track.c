@@ -255,6 +255,8 @@ typedef struct {
     bool searched;
     int64_t last_search_ns;
     int64_t locked_until_ns;    // the prior's yaw was confirmed recently: search near it only
+    int64_t confirmed_ns;       // when a fit on plenty of LEDs last confirmed it
+    bool tracking_poor;         // the last fit left many of its dots unexplained
 } hand_state;
 
 enum { CAL_SAMPLES = 40 };
@@ -661,23 +663,25 @@ static int polish(const problem *pr, hpose *P, float wide_gate, match *m, float 
     return best;
 }
 
-// Where a hand can be: within arm's reach of the head and not above it. Ceiling lights and lamps
-// across the room fit a controller's LEDs now and then, a metre or two away.
+// Where a hand can be: within arm's reach of the head. Ceiling lights and lamps across the room fit a
+// controller's LEDs now and then, a metre or two away.
 static bool reachable(const hpose *P) {
-    return norm3(P->p) < 1.0f && P->p[1] < 0.3f;
+    return norm3(P->p) < 1.05f;
 }
 
 // Every dot near another, every pair of neighbouring LEDs, and every turn about the vertical that
 // the prior might be off by: the two LEDs on the two dots fix a position (the turn is known), and
 // the poses that put the most other LEDs on dots are refined.
-static int search(const problem *base, bool locked, hpose *found, match *m, float *rms) {
+// Searches turns of the prior about the vertical up to range radians either way (all the way round
+// from pi): just confirmed, its yaw is off by a few degrees; since then an IMU drifts a degree or so
+// a second, and once that's unknown it may be off by anything. A wider search than needed finds the
+// other controller's mirror-image LEDs.
+static int search(const problem *base, float range, hpose *found, match *m, float *rms) {
     const strack *t = base->t;
     hypothesis best[HYPOTHESES];
     int nbest = 0;
-    // Unconfirmed, it may be off by anything: an IMU's yaw drifts, and in the headset one was off
-    // by 80 degrees after a minute, outside a search of 90 either way once the last fit is counted.
-    int steps = locked ? 3 : 36;
-    float step = locked ? 8 * DEG : 10 * DEG;
+    float step = range < 10 * DEG ? range : 10 * DEG;
+    int steps = range >= PI_F ? 36 : 2 * (int)ceilf(range / step) + 1;
     for (int s = 0; s < steps; s++) {
         float yaw = (s - steps / 2) * step, Ryaw[9];
         hpose P;
@@ -1043,7 +1047,9 @@ int strack_calibration(const strack *t, float *rms_px) {
 
 // Every dot within the controller's reach of where it is, in each camera: its LEDs at a slant
 // that weren't matched, glints off it, so that a search for the other controller leaves them be.
-static void claim_around(strack *t, const hpose *P) {
+// Returns how many it claimed that weren't claimed already.
+static int claim_around(strack *t, const hpose *P) {
+    int newly = 0;
     for (int c = 0; c < STRACK_CAMERAS; c++) {
         float w[3], pc[3];
         for (int k = 0; k < 3; k++) w[k] = P->p[k] - t->cam[c].position[k];
@@ -1052,13 +1058,18 @@ static void claim_around(strack *t, const hpose *P) {
         if (d < 0.05f) continue;
         float reach = cosf(atanf(0.12f / d));
         for (int b = 0; b < t->nblobs[c]; b++)
-            if (dot3(t->blobs[c][b].ray, pc) / d > reach) t->claimed[c][b] = true;
+            if (!t->claimed[c][b] && dot3(t->blobs[c][b].ray, pc) / d > reach) {
+                t->claimed[c][b] = true;
+                newly++;
+            }
     }
+    return newly;
 }
 
 typedef struct {
     problem pr;
     bool locked, following;
+    float range;            // of the yaw search, radians either way
     float Rw[9], Rc[9];     // the prior as given, and as corrected by the tracker's yaw
     float dt;
 } hand_job;
@@ -1073,7 +1084,9 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     if (na >= n) keep_sample(t, in, h, &j->pr, P, all, na);
     else keep_sample(t, in, h, &j->pr, P, m, n);
     for (int i = 0; i < n; i++) t->claimed[m[i].cam][m[i].blob] = true;
-    claim_around(t, P);
+    // Plenty of its dots left unexplained: the fit is turned wrong (the IMU's orientation is off
+    // by more than a follow corrects). Search afresh next frame, more widely.
+    if (claim_around(t, P) >= 6 && n < 10) hs->tracking_poor = true;
     float R[9], p[3], D[9], e[3];
     world_from_head(in, P, R, p);
     if (j->following && j->dt > 1e-3f) {
@@ -1094,7 +1107,10 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     memcpy(hs->p, p, sizeof p);
     // Only a fit on plenty of LEDs confirms the yaw: one on three or four can be turned well off
     // the truth, and locked onto that the search never looks wider again.
-    if (n >= 6) hs->locked_until_ns = in->time_ns + 2000000000LL;
+    if (n >= 6) {
+        hs->locked_until_ns = in->time_ns + 2000000000LL;
+        hs->confirmed_ns = in->time_ns;
+    }
     o->valid = true;
     o->found = found;
     mat_to_quat(R, o->pose.q);
@@ -1106,7 +1122,7 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
 
 static bool search_hand(strack *t, hand_job *j, hpose *P, match *m, int *n, float *rms) {
     *rms = 1e9f;
-    *n = search(&j->pr, j->locked, P, m, rms);
+    *n = search(&j->pr, j->range, P, m, rms);
     return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= t->prm.max_rms_px && reachable(P);
 }
 
@@ -1122,7 +1138,12 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         if (!in->prior_valid[h]) { hs->tracking = false; continue; }
         // The IMU's orientation, turned by what the last fits found its yaw to be off by while that
         // is fresh; then the fit holds to its yaw nearly as firmly as to its tilt.
-        j->locked = in->time_ns < hs->locked_until_ns;
+        bool poor = hs->tracking_poor;
+        hs->tracking_poor = false;
+        if (poor) hs->searched = false;   // due now
+        j->locked = !poor && in->time_ns < hs->locked_until_ns;
+        float age = (in->time_ns - hs->confirmed_ns) / 1e9f;
+        j->range = j->locked ? 8 * DEG : hs->confirmed_ns && age < 60 ? (25 + 1.5f * age) * DEG : PI_F;
         j->pr = (problem){.t = t, .hand = h, .w_tilt = 30, .w_yaw = j->locked ? 12.0f : 2.0f};
         float Ryaw[9];
         quat_to_mat(in->prior_q[h], j->Rw);
@@ -1132,7 +1153,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         mtm(Rh, j->Rc, j->pr.prior);
         mtv(Rh, upw, j->pr.up);
         j->dt = (in->time_ns - hs->t_ns) / 1e9f;
-        j->following = hs->tracking && j->dt > 0 && j->dt < 0.25f;
+        j->following = !poor && hs->tracking && j->dt > 0 && j->dt < 0.25f;
         if (!j->following) hs->tracking = false;
     }
 
