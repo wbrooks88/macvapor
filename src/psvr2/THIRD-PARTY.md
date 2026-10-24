@@ -48,6 +48,14 @@ The eye-tracking enable command and the `gaze_status_t` packet layout
 (`tools/psvr2_gaze.c`), and the camera/passthrough enable command
 (`player/cpsvr2.c`, `tools/psvr2_camera.c`) come from PSVR2Toolkit.
 
+In MacVapoR, `cpsvr2.c`'s eye tracker (the gaze state layout, the stream
+enable, the user calibration's upload endpoint and its `VD` item, and the
+calibration reports 0x0D/0x8D) follows PSVR2Toolkit, and the calibration
+targets and sequence in `backend_psvr2.m` follow PSVR2Toolkit.UnitySetup
+(https://github.com/BnuuySolutions/PSVR2Toolkit.UnitySetup), cross-checked
+against Monado's `psvr2_eye.c`. PSVR2Toolkit asks that its eye-tracking data
+not be used commercially.
+
 Licensed under the MIT License:
 
 ```

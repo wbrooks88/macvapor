@@ -19,6 +19,9 @@ What works in this first stage:
   (grayscale) in place of the game, and double-press again to go back. The game keeps running.
 - The Sense controllers over Bluetooth: buttons, sticks, triggers, finger sensors, vibration, and
   orientation from each controller's own motion sensor. Games see them as Quest Touch controllers.
+- Eye tracking from the headset's own eye tracker: games that ask for eye gaze get it, games that
+  render quad views get foveated rendering, and holding Fn for 2 seconds calibrates it (see
+  [Eye tracking](#eye-tracking)).
 
 Not yet: the controllers' position. Tracking where they are needs the headset's cameras to watch
 their light rings, and no open code does that on a Mac yet. Until then each hand is placed by an
@@ -143,13 +146,53 @@ run, and read when a game starts:
 | `chromatic` | true | Per-colour lens correction. |
 | `lookahead_ms` | 0 | Adds to the head prediction. Raise it if the world seems to lag your head when you turn. |
 | `controllers` | true | Use the Sense controllers over Bluetooth. |
+| `eye_tracking` | true | Use the headset's eye tracker. |
+| `show_gaze` | false | Draw a yellow ring where you look, to check the eye tracker. |
+| `foveated` | true | Offer foveated rendering (quad views) to games that support it. |
+| `foveated_area_deg` | 40 | Width and height of the sharp area that follows your eyes, in degrees. |
+| `foveated_outer_scale` | 0.5 | Resolution of the rest of the view, as a share of `render_scale`'s. |
+| `foveated_inset_scale` | 1.0 | Resolution of the sharp area, as a share of the panel's at its centre. |
 | `positional` | false | Experimental: use the headset's own position tracking instead of the neck model. The axes are a guess; if moving your head moves the world the wrong way, turn it back off and send me the log. |
+
+## Eye tracking
+
+The PS VR2 tracks both eyes with its own cameras and works out where you look itself; the Mac only
+reads the result over USB, about 120 times a second. No jailbreak is needed for this (PSVR2Toolkit
+needs one only for the headset's outside cameras).
+
+**Calibrate once.** In MacVapoR press **Calibrate eyes** (or run
+`out/psvr2xr-selftest --calibrate-eyes`), or hold the headset's **Fn** button for 2 seconds during
+any game. Look at each dot until the next one appears: 8 on black, then 5 on light grey, about a
+minute. The headset reports the result, which is saved to
+`~/Library/Application Support/psvr2xr/eye_calibration.bin` and sent to the headset every time a game
+starts. A calibration you made on a PS5 may already be in the headset; the log says which one it
+holds (`user calibration` on the `eyes:` line, 0 for none).
+
+**Check it.** **Foveated test** (or `out/psvr2xr-selftest --foveated`) shows the test room with a
+yellow ring where you look. If the ring sits off to one side of what you look at, calibrate again.
+`show_gaze` puts the ring in games too.
+
+**In games.** Two things use it:
+
+- Eye gaze (`XR_EXT_eye_gaze_interaction`): games and apps that read where you look (aiming,
+  menus, social apps' eyes) get it from the headset.
+- Foveated rendering (`XR_VARJO_quad_views` with `XR_VARJO_foveated_rendering`): the game renders
+  the whole view at a low resolution and a small sharp area where you look. With the defaults that
+  is about a third of the pixels of a normal frame, which matters most on a MacBook Air. Only games
+  that support quad views can do this (DCS World, for example, and some Unreal Engine games); a
+  game that doesn't renders as before.
+  The log says `session uses quad views` when a game takes it. Most SteamVR games, which run
+  through OpenComposite, don't.
+
+If the ring jumps around or the log says `NOT tracked` while
+your eyes are open, adjust the headset so it sits level and the IPD dial matches your eyes.
 
 ## Logs
 
 `~/Library/Logs/psvr2xr.log` gets a line every 5 seconds: the game's frame rate, how many frames
 the panel composed and repeated, whether the head is tracked, the IPD dial, and raw tracking
-numbers. Each connected controller gets a line too (battery, buttons, stick, trigger, where it
+numbers. With the eye tracker on, an `eyes:` line gives its sample rate, where you look, pupil size,
+blinks and the calibration it holds. Each connected controller gets a line too (battery, buttons, stick, trigger, where it
 points), and its calibration is logged when it connects. Send it along with what you saw.
 
 ## How it works

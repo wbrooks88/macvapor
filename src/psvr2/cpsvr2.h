@@ -67,6 +67,67 @@ void psvr2_camera_stop(void);
  * Returns 1 if the frame is new (since the previous call), 0 otherwise. */
 int psvr2_camera_get_frame(unsigned char *left, unsigned char *right);
 
+/* --- Eye tracking ---
+ * The headset's own eye tracker sends a 'G','S' gaze state on interface 5, EP 0x85, about 120
+ * times a second, while vendor command 0x0C (subcommand 1) keeps it on. The layout is the one
+ * PSVR2Toolkit (MIT) and Monado's driver (BSL-1.0) agree on. Directions are mapped into the
+ * head's axes as both do: x right, y up, -z forward. */
+
+typedef struct {
+	int valid;               /* the combined direction is valid */
+	float dir[3];            /* combined gaze direction, unit vector in head axes */
+	int origin_valid;
+	float origin_m[3];       /* combined gaze origin in metres from the headset's centre */
+	int eye_valid[2];        /* left, right */
+	float eye_dir[2][3];
+	float eye_origin_m[2][3];
+	float pupil_mm[2];       /* 0 when unknown */
+	int blink[2];            /* 1: that eye is closed */
+	unsigned calibration_id; /* 0: the headset holds no user calibration */
+	unsigned frame;          /* the headset's gaze frame counter */
+	double age_s;            /* since the packet arrived; large when none has */
+} psvr2_gaze;
+
+/* Turns the eye tracker on and starts reading it. calibration_path is a user calibration to send
+ * first if the file exists, and where a new one is saved when the headset reports it (after a
+ * calibration, interface 10's 'V','D' data, item 3, as PSVR2Toolkit saves it). NULL for neither.
+ * 0: success. */
+int psvr2_gaze_start(const char *calibration_path);
+
+void psvr2_gaze_stop(void);
+
+/* The newest gaze state. Returns 1 if one has arrived. */
+int psvr2_get_gaze(psvr2_gaze *out);
+
+/* Gaze packets received since the previous call. */
+unsigned psvr2_gaze_packets(void);
+
+/* Calibration (report 0x0D to set, 0x8D to read back; the sequence is PSVR2Toolkit.UnitySetup's):
+ * SET_EYE (arg: 0 left, 1 right, 2 both), START, then per target COLLECT with the target's
+ * position in millimetres (x left, y up, +z ahead of the eyes) and poll until result is 0,
+ * COMPUTE after each stage and poll until status is COMPUTE_OK or COMPUTE_FAILED, then STOP,
+ * SET_EYE both, and RETRIEVE, which makes the headset report the new calibration on VD. */
+enum {
+	PSVR2_GAZE_CAL_START = 1,
+	PSVR2_GAZE_CAL_COLLECT = 2,
+	PSVR2_GAZE_CAL_DISCARD = 3,
+	PSVR2_GAZE_CAL_COMPUTE = 4,
+	PSVR2_GAZE_CAL_RETRIEVE = 5,
+	PSVR2_GAZE_CAL_STOP = 6,
+	PSVR2_GAZE_CAL_SET_EYE = 7,
+};
+enum { PSVR2_GAZE_STATUS_COMPUTE_OK = 5, PSVR2_GAZE_STATUS_COMPUTE_FAILED = 6 };
+enum { PSVR2_GAZE_RESULT_OK = 0, PSVR2_GAZE_RESULT_FAILED = 1, PSVR2_GAZE_RESULT_WAITING = 3 };
+
+int psvr2_gaze_calibration_command(int mode, float x_mm, float y_mm, float z_mm, int arg);
+
+/* The calibration status (enum above, or 1 for tracking) and the last point's result.
+ * 0: success. */
+int psvr2_gaze_calibration_status(int *status, int *result);
+
+/* Seconds since a calibration blob last arrived on VD and was saved; negative if none has. */
+double psvr2_gaze_calibration_saved_age(void);
+
 #ifdef __cplusplus
 }
 #endif

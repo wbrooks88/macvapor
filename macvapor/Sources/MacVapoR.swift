@@ -99,6 +99,13 @@ enum PSVR2 {
         var reprojection = true
         var positional = false
         var controllers = true
+        var eyeTracking = true
+        var showGaze = false
+        var foveated = true
+        // Kept as read, so saving doesn't reset what was set in config.json by hand.
+        var foveatedAreaDeg = 40.0
+        var foveatedOuterScale = 0.5
+        var foveatedInsetScale = 1.0
 
         static func load() -> Settings {
             var s = Settings()
@@ -111,13 +118,21 @@ enum PSVR2 {
             s.reprojection = c["reprojection"] as? Bool ?? s.reprojection
             s.positional = c["positional"] as? Bool ?? s.positional
             s.controllers = c["controllers"] as? Bool ?? s.controllers
+            s.eyeTracking = c["eye_tracking"] as? Bool ?? s.eyeTracking
+            s.showGaze = c["show_gaze"] as? Bool ?? s.showGaze
+            s.foveated = c["foveated"] as? Bool ?? s.foveated
+            s.foveatedAreaDeg = c["foveated_area_deg"] as? Double ?? s.foveatedAreaDeg
+            s.foveatedOuterScale = c["foveated_outer_scale"] as? Double ?? s.foveatedOuterScale
+            s.foveatedInsetScale = c["foveated_inset_scale"] as? Double ?? s.foveatedInsetScale
             return s
         }
 
         func save() {
             let c: [String: Any] = ["render_scale": renderScale, "eye_height": eyeHeight, "lookahead_ms": lookaheadMs,
                                     "chromatic": chromatic, "reprojection": reprojection, "positional": positional,
-                                    "controllers": controllers]
+                                    "controllers": controllers, "eye_tracking": eyeTracking, "show_gaze": showGaze,
+                                    "foveated": foveated, "foveated_area_deg": foveatedAreaDeg,
+                                    "foveated_outer_scale": foveatedOuterScale, "foveated_inset_scale": foveatedInsetScale]
             try? FileManager.default.createDirectory(at: Paths.psvr2Config.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let out = try? JSONSerialization.data(withJSONObject: c, options: [.prettyPrinted, .sortedKeys]) {
                 try? out.write(to: Paths.psvr2Config, options: .atomic)
@@ -410,16 +425,30 @@ final class Model: ObservableObject {
         output = "Starting \(game.name) through Steam." + (notes.isEmpty ? "" : " Note: " + notes.joined(separator: "; ") + ".")
     }
 
-    func startSelftest(slow: Bool) {
+    enum SelftestMode { case normal, slow, calibrateEyes, foveated }
+
+    func startSelftest(_ mode: SelftestMode) {
         guard selftest == nil else { return }
         let p = Process()
         p.executableURL = Paths.psvr2Selftest
-        p.arguments = slow ? ["--slow", "2"] : []
+        switch mode {
+        case .normal: p.arguments = []
+        case .slow: p.arguments = ["--slow", "2"]
+        case .calibrateEyes: p.arguments = ["--calibrate-eyes"]
+        case .foveated: p.arguments = ["--foveated"]
+        }
         p.terminationHandler = { _ in Task { @MainActor in self.selftest = nil } }
         do {
             try p.run()
             selftest = p
-            output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
+            switch mode {
+            case .calibrateEyes:
+                output = "Eye calibration: put the headset on and look at each dot until the next one appears (13 dots, about a minute). Press Stop when the test room comes back."
+            case .foveated:
+                output = "Foveated test: the test room, with the sharp area tinted orange. It should follow your eyes, with a yellow ring where you look."
+            default:
+                output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
+            }
         } catch {
             output = "Could not start the self-test: \(error.localizedDescription)"
         }
@@ -846,10 +875,18 @@ struct ContentView: View {
                     Text("Self-test: a test room in the headset, without a game.").foregroundStyle(.secondary)
                     Spacer()
                     if model.selftest == nil {
-                        Button("Run") { model.startSelftest(slow: false) }
-                        Button("Run at half rate") { model.startSelftest(slow: true) }
+                        Button("Run") { model.startSelftest(.normal) }
+                        Button("Run at half rate") { model.startSelftest(.slow) }
                     } else {
                         Button("Stop") { model.stopSelftest() }
+                    }
+                }
+                HStack {
+                    Text("Eye tracking: calibrate it once (it is saved), then check it follows your eyes.").foregroundStyle(.secondary)
+                    Spacer()
+                    if model.selftest == nil {
+                        Button("Calibrate eyes") { model.startSelftest(.calibrateEyes) }
+                        Button("Foveated test") { model.startSelftest(.foveated) }
                     }
                 }
                 Divider()
@@ -873,7 +910,10 @@ struct ContentView: View {
                 Toggle("Per-colour lens correction", isOn: $model.psvr2Settings.chromatic)
                 Toggle("Room-scale position (experimental)", isOn: $model.psvr2Settings.positional)
                 Toggle("Sense controllers", isOn: $model.psvr2Settings.controllers)
-                Text("Takes effect the next time a game starts. The headset's Fn button recenters the view and the controllers; a controller's PS button points it forward again.")
+                Toggle("Eye tracking", isOn: $model.psvr2Settings.eyeTracking)
+                Toggle("Show where I look (a yellow ring)", isOn: $model.psvr2Settings.showGaze)
+                Toggle("Foveated rendering, in games that support it (quad views)", isOn: $model.psvr2Settings.foveated)
+                Text("Takes effect the next time a game starts. The headset's Fn button recenters the view and the controllers; hold it for 2 seconds to calibrate the eye tracker. A controller's PS button points it forward again.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)

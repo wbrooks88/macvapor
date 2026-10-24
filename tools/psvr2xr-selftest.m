@@ -7,6 +7,10 @@
 //   out/psvr2xr-selftest --slow N   render only every Nth frame, as a slow game would; with
 //                                   reprojection on, turning your head should still look smooth
 //   out/psvr2xr-selftest --shaders-only   compile the test room's shader and exit (for CI)
+//   out/psvr2xr-selftest --calibrate-eyes calibrate the eye tracker first (13 dots), then the room
+//   out/psvr2xr-selftest --foveated       render quad views as a foveated game would: a low-
+//                                   resolution room with a sharp inset, tinted orange, that
+//                                   follows your eyes; a yellow ring shows where you look
 //
 // The room: a floor grid with 1 m squares, a horizon, and four pillars 3 m away: red ahead,
 // green to the right, blue behind and yellow to the left. Straight grid lines and a level horizon
@@ -35,7 +39,7 @@ static const char *scene_source =
     "    o.uv = float2(p[vid].x * 0.5 + 0.5, 1.0 - (p[vid].y * 0.5 + 0.5));\n"
     "    return o;\n"
     "}\n"
-    "struct Eye { float4x4 rot; float4 origin; float4 tans; float4 hand[2]; float4 tip[2]; };\n"   // tans: tan of left, right, up, down; hand/tip w: shown, trigger
+    "struct Eye { float4x4 rot; float4 origin; float4 tans; float4 hand[2]; float4 tip[2]; };\n"   // tans: tan of left, right, up, down; hand/tip w: shown, trigger; origin w: 2 tints an inset
     "static float pillar(float3 o, float3 d, float2 c, float r) {\n"   // distance along d to a vertical cylinder
     "    float2 oc = o.xz - c; float2 dd = d.xz;\n"
     "    float a = dot(dd, dd), b = dot(oc, dd), k = dot(oc, oc) - r * r;\n"
@@ -85,6 +89,7 @@ static const char *scene_source =
     "        t = ball(o, d, e.tip[i].xyz, 0.015);\n"
     "        if (t > 0.0 && t < best) { best = t; col = float3(1.0); }\n"
     "    }\n"
+    "    if (e.origin.w > 1.5) col = mix(col, float3(1.0, 0.55, 0.1), 0.25);\n"
     "    return float4(col, 1.0);\n"
     "}\n";
 
@@ -97,7 +102,7 @@ typedef struct {
 } eye_uniform;
 
 static int g_slow = 1;
-static bool g_shaders_only;
+static bool g_shaders_only, g_calibrate_eyes, g_foveated;
 static id<MTLRenderPipelineState> g_scene;
 static id<MTLCommandQueue> g_queue;
 
@@ -112,19 +117,26 @@ static void matrix_from(const float q[4], float m[16]) {   // x, y, z, w; column
 
 static void *render_thread(void *arg) {
     (void)arg;
-    uint32_t w, h;
-    axr_recommended_eye_size(&w, &h);
+    uint32_t size[4][2];   // per view: the eyes, and with --foveated the insets
+    axr_recommended_eye_size(&size[0][0], &size[0][1]);
+    int views = g_foveated ? 4 : 2;
+    if (g_foveated) axr_foveated_sizes(size[0], size[2]);
+    memcpy(size[1], size[0], sizeof size[0]);
+    memcpy(size[3], size[2], sizeof size[2]);
+    uint32_t w = size[0][0], h = size[0][1];
     id<MTLDevice> dev = axr_metal_device();
-    id<MTLTexture> tex[3][2];   // a small swapchain, as the runtime gives a game
+    id<MTLTexture> tex[3][4];   // a small swapchain, as the runtime gives a game
     for (int i = 0; i < 3; i++)
-        for (int e = 0; e < 2; e++) {
+        for (int e = 0; e < views; e++) {
             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
-                                                                                         width:w height:h mipmapped:NO];
+                                                                                         width:size[e][0] height:size[e][1]
+                                                                                     mipmapped:NO];
             d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             d.storageMode = MTLStorageModePrivate;
             tex[i][e] = [dev newTextureWithDescriptor:d];
         }
     printf("rendering %ux%u per eye%s\n", w, h, g_slow > 1 ? " (slowed down)" : "");
+    if (g_foveated) printf("and a %ux%u inset per eye that follows your eyes\n", size[2][0], size[2][1]);
     unsigned frame = 0;
     for (;;) {
         @autoreleasepool {
@@ -132,6 +144,8 @@ static void *render_thread(void *arg) {
             for (int skip = 1; skip < g_slow; skip++) t = axr_wait_frame();
             axr_motion head = axr_device_motion(AXR_HEAD, t);
             axr_views v = axr_current_views();
+            float inset[2][4];
+            if (g_foveated) axr_foveated_inset(t, true, inset);
             float hands[2][4] = {{0}}, tips[2][4] = {{0}};
             for (int k = 0; k < 2; k++) {
                 axr_motion m = axr_device_motion(k == 0 ? AXR_LEFT : AXR_RIGHT, t);
@@ -150,15 +164,15 @@ static void *render_thread(void *arg) {
             }
             int i = frame++ % 3;
             id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-            for (int e = 0; e < 2; e++) {
+            for (int e = 0; e < views; e++) {
                 eye_uniform u;
                 matrix_from(head.pose.orientation, u.rot);
                 // The eye's offset in the head, turned with the head.
-                const float *off = v.eye_in_head[e].position;
+                const float *off = v.eye_in_head[e % 2].position;
                 for (int k = 0; k < 3; k++)
                     u.origin[k] = head.pose.position[k] + u.rot[k] * off[0] + u.rot[4 + k] * off[1] + u.rot[8 + k] * off[2];
-                u.origin[3] = 1;
-                for (int k = 0; k < 4; k++) u.tans[k] = tanf(v.fov[e][k]);
+                u.origin[3] = e < 2 ? 1 : 2;
+                for (int k = 0; k < 4; k++) u.tans[k] = tanf(e < 2 ? v.fov[e][k] : inset[e - 2][k]);
                 memcpy(u.hand, hands, sizeof hands);
                 memcpy(u.tip, tips, sizeof tips);
                 MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -172,8 +186,11 @@ static void *render_thread(void *arg) {
                 [enc endEncoding];
             }
             [cmd commit];
-            axr_eye_image eyes[2] = {{tex[i][0], 0, 0, 0, (int32_t)w, (int32_t)h}, {tex[i][1], 0, 0, 0, (int32_t)w, (int32_t)h}};
-            axr_submit(t, eyes, g_queue);
+            axr_eye_image eyes[4];
+            for (int e = 0; e < views; e++)
+                eyes[e] = (axr_eye_image){tex[i][e], 0, 0, 0, (int32_t)size[e][0], (int32_t)size[e][1]};
+            if (g_foveated) axr_submit_quad(t, eyes, inset, g_queue);
+            else axr_submit(t, eyes, g_queue);
         }
     }
     return NULL;
@@ -184,6 +201,8 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++)
             if (!strcmp(argv[i], "--slow") && i + 1 < argc) g_slow = atoi(argv[++i]) > 1 ? atoi(argv[i]) : 1;
             else if (!strcmp(argv[i], "--shaders-only")) g_shaders_only = true;
+            else if (!strcmp(argv[i], "--calibrate-eyes")) g_calibrate_eyes = true;
+            else if (!strcmp(argv[i], "--foveated")) g_foveated = true;
         if (g_shaders_only) {
             id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
             if (!dev) { puts("no Metal device; shader not checked"); return 0; }
@@ -195,6 +214,7 @@ int main(int argc, char **argv) {
         }
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        if (g_foveated || g_calibrate_eyes) setenv("PSVR2XR_SHOW_GAZE", "1", 1);   // the gaze ring
         axr_backend_start();   // on the main thread, so the headset window is made right away
 
         id<MTLDevice> dev = axr_metal_device();
@@ -215,9 +235,20 @@ int main(int argc, char **argv) {
                "a trigger to light one and feel it buzz, press PS to point it forward again.\n"
                "Status every 5 s here and in ~/Library/Logs/psvr2xr.log.\n"
                "Quit with Ctrl-C.\n");
+        if (g_calibrate_eyes)
+            printf("Eye calibration starts as soon as the headset tracks: look at each dot until the next one\n"
+                   "appears. Afterwards the room comes back with a yellow ring where you look.\n");
+        if (g_foveated && !axr_eye_tracking())
+            printf("The eye tracker is off or not found, so the sharp inset stays in the middle.\n");
         pthread_t t;
         pthread_create(&t, NULL, render_thread, NULL);
         pthread_detach(t);
+        if (g_calibrate_eyes) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                for (int i = 0; i < 300 && !axr_backend_tracking(); i++) usleep(100000);
+                axr_eye_calibrate();
+            });
+        }
         [NSApp run];
     }
     return 0;

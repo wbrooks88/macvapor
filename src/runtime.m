@@ -30,6 +30,7 @@ typedef struct instance {
     uint32_t magic;
     NSMutableArray *events;          // NSData of XrEventDataBuffer-sized events, oldest first
     NSMutableDictionary *suggested;  // profile path -> NSMutableArray of @[action ptr, binding path]
+    bool eye_gaze, quad_views, foveated;   // extensions the app enabled
 } instance;
 
 typedef struct session session;
@@ -92,6 +93,7 @@ struct session {
     bool running, exit_requested;
     NSMutableArray<NSValue *> *action_sets;
     XrPath profile;                          // active interaction profile
+    XrViewConfigurationType view_config;     // stereo, or quad views
     XrPosef local;                           // LOCAL's origin in STAGE
     bool local_from_headset;
 };
@@ -190,8 +192,13 @@ static const XrExtensionProperties g_extensions[] = {
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION},
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION},
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_composition_layer_depth_SPEC_VERSION},
+    // Listed only when the backend's headset has an eye tracker (EYE_EXTENSIONS_FROM onwards).
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME, XR_EXT_eye_gaze_interaction_SPEC_VERSION},
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_VARJO_QUAD_VIEWS_EXTENSION_NAME, XR_VARJO_quad_views_SPEC_VERSION},
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_VARJO_FOVEATED_RENDERING_EXTENSION_NAME, XR_VARJO_foveated_rendering_SPEC_VERSION},
 };
-#define EXTENSION_COUNT (sizeof g_extensions / sizeof g_extensions[0])
+#define EYE_EXTENSIONS_FROM 5
+#define EXTENSION_COUNT (axr_backend_has_eye_tracker() ? sizeof g_extensions / sizeof g_extensions[0] : EYE_EXTENSIONS_FROM)
 
 static XrResult xrEnumerateInstanceExtensionProperties_(const char *layer, uint32_t cap, uint32_t *n,
                                                         XrExtensionProperties *props) {
@@ -201,10 +208,15 @@ static XrResult xrEnumerateInstanceExtensionProperties_(const char *layer, uint3
 }
 
 static XrResult xrCreateInstance_(const XrInstanceCreateInfo *info, XrInstance *out) {
+    bool eye_gaze = false, quad_views = false, foveated = false;
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
+        const char *name = info->enabledExtensionNames[i];
         bool known = false;
         for (size_t e = 0; e < EXTENSION_COUNT; e++)
-            if (!strcmp(info->enabledExtensionNames[i], g_extensions[e].extensionName)) known = true;
+            if (!strcmp(name, g_extensions[e].extensionName)) known = true;
+        eye_gaze |= !strcmp(name, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        quad_views |= !strcmp(name, XR_VARJO_QUAD_VIEWS_EXTENSION_NAME);
+        foveated |= !strcmp(name, XR_VARJO_FOVEATED_RENDERING_EXTENSION_NAME);
         if (!known) {
             axr_log("app asked for unsupported extension %s", info->enabledExtensionNames[i]);
             return XR_ERROR_EXTENSION_NOT_PRESENT;
@@ -216,12 +228,17 @@ static XrResult xrCreateInstance_(const XrInstanceCreateInfo *info, XrInstance *
     inst->magic = MAGIC_INSTANCE;
     inst->events = [NSMutableArray array];
     inst->suggested = [NSMutableDictionary dictionary];
+    inst->eye_gaze = eye_gaze;
+    inst->quad_views = quad_views;
+    inst->foveated = foveated && quad_views;
     CFRetain((__bridge CFTypeRef)inst->events);
     CFRetain((__bridge CFTypeRef)inst->suggested);
     g_instance = inst;
     if (!g_paths) g_paths = [NSMutableArray array];
     pthread_mutex_unlock(&g_lock);
-    axr_log("instance for \"%s\" (engine \"%s\")", info->applicationInfo.applicationName, info->applicationInfo.engineName);
+    axr_log("instance for \"%s\" (engine \"%s\")%s%s%s", info->applicationInfo.applicationName,
+            info->applicationInfo.engineName, eye_gaze ? ", eye gaze" : "", quad_views ? ", quad views" : "",
+            foveated ? ", foveated rendering" : "");
     axr_backend_start();
     *out = (XrInstance)inst;
     return XR_SUCCESS;
@@ -298,14 +315,33 @@ static XrResult xrGetSystemProperties_(XrInstance h, XrSystemId sys, XrSystemPro
     p->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     p->trackingProperties.orientationTracking = XR_TRUE;
     p->trackingProperties.positionTracking = XR_TRUE;
+    instance *inst = (instance *)h;
+    for (XrBaseOutStructure *n = p->next; n; n = n->next) {
+        if (n->type == XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT && inst->eye_gaze)
+            ((XrSystemEyeGazeInteractionPropertiesEXT *)n)->supportsEyeGazeInteraction = axr_eye_tracking();
+        if (n->type == XR_TYPE_SYSTEM_FOVEATED_RENDERING_PROPERTIES_VARJO && inst->foveated)
+            ((XrSystemFoveatedRenderingPropertiesVARJO *)n)->supportsFoveatedRendering =
+                axr_foveated_supported() && axr_eye_tracking();
+    }
     return XR_SUCCESS;
+}
+
+// Quad views (XR_VARJO_quad_views): each eye's whole view (views 0 and 1) and a sharper inset of
+// it (views 2 and 3), which follows the eyes with XR_VARJO_foveated_rendering.
+static bool quad_views(XrInstance h) { return ((instance *)h)->quad_views && axr_foveated_supported(); }
+
+static bool view_config_ok(XrInstance h, XrViewConfigurationType t) {
+    return t == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || (t == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO && quad_views(h));
 }
 
 static XrResult xrEnumerateViewConfigurations_(XrInstance h, XrSystemId sys, uint32_t cap, uint32_t *n,
                                                XrViewConfigurationType *out) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
     if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
-    TWO_CALL(cap, n, out, x, 1, out[i_] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO);
+    // Stereo first: an app that takes the first one it is given gets what it always got.
+    static const XrViewConfigurationType types[] = {XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO};
+    TWO_CALL(cap, n, out, types, quad_views(h) ? 2 : 1, out[i_] = types[i_]);
     return XR_SUCCESS;
 }
 
@@ -313,7 +349,7 @@ static XrResult xrGetViewConfigurationProperties_(XrInstance h, XrSystemId sys, 
                                                   XrViewConfigurationProperties *p) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
     if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
-    if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    if (!view_config_ok(h, t)) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     p->viewConfigurationType = t;
     p->fovMutable = XR_FALSE;
     return XR_SUCCESS;
@@ -323,12 +359,18 @@ static XrResult xrEnumerateViewConfigurationViews_(XrInstance h, XrSystemId sys,
                                                    uint32_t cap, uint32_t *n, XrViewConfigurationView *out) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
     if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
-    if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
-    uint32_t w, hh;
-    axr_recommended_eye_size(&w, &hh);
-    TWO_CALL(cap, n, out, x, 2, {
-        out[i_].recommendedImageRectWidth = w;
-        out[i_].recommendedImageRectHeight = hh;
+    if (!view_config_ok(h, t)) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    uint32_t size[4][2];
+    axr_recommended_eye_size(&size[0][0], &size[0][1]);
+    bool quad = t == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO;
+    if (quad) axr_foveated_sizes(size[0], size[2]);
+    memcpy(size[1], size[0], sizeof size[0]);
+    memcpy(size[3], size[2], sizeof size[2]);
+    // The sizes are the same whether or not the inset follows the eyes
+    // (XrFoveatedViewConfigurationViewVARJO), so that chained struct needs no answer.
+    TWO_CALL(cap, n, out, x, quad ? 4 : 2, {
+        out[i_].recommendedImageRectWidth = size[i_][0];
+        out[i_].recommendedImageRectHeight = size[i_][1];
         out[i_].maxImageRectWidth = 8192;
         out[i_].maxImageRectHeight = 8192;
         out[i_].recommendedSwapchainSampleCount = 1;
@@ -341,7 +383,7 @@ static XrResult xrEnumerateEnvironmentBlendModes_(XrInstance h, XrSystemId sys, 
                                                   uint32_t cap, uint32_t *n, XrEnvironmentBlendMode *out) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
     if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
-    if (t != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    if (!view_config_ok(h, t)) return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     TWO_CALL(cap, n, out, x, 1, out[i_] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
     return XR_SUCCESS;
 }
@@ -457,12 +499,14 @@ static XrResult xrDestroySession_(XrSession h) {
 static XrResult xrBeginSession_(XrSession h, const XrSessionBeginInfo *info) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     session *s = (session *)h;
-    if (info->primaryViewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+    if (!view_config_ok((XrInstance)s->inst, info->primaryViewConfigurationType))
         return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     pthread_mutex_lock(&g_lock);
     if (s->running) { pthread_mutex_unlock(&g_lock); return XR_ERROR_SESSION_RUNNING; }
     if (s->state != XR_SESSION_STATE_READY) { pthread_mutex_unlock(&g_lock); return XR_ERROR_SESSION_NOT_READY; }
     s->running = true;
+    s->view_config = info->primaryViewConfigurationType;
+    if (s->view_config == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO) axr_log("session uses quad views");
     set_state(s, XR_SESSION_STATE_SYNCHRONIZED);
     set_state(s, XR_SESSION_STATE_VISIBLE);
     set_state(s, XR_SESSION_STATE_FOCUSED);
@@ -532,8 +576,9 @@ static const XrPosef IDENTITY = {{0, 0, 0, 1}, {0, 0, 0}};
 static XrResult xrEnumerateReferenceSpaces_(XrSession h, uint32_t cap, uint32_t *n, XrReferenceSpaceType *out) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     static const XrReferenceSpaceType types[] = {XR_REFERENCE_SPACE_TYPE_VIEW, XR_REFERENCE_SPACE_TYPE_LOCAL,
-                                                 XR_REFERENCE_SPACE_TYPE_STAGE, XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR};
-    TWO_CALL(cap, n, out, types, 4, out[i_] = types[i_]);
+                                                 XR_REFERENCE_SPACE_TYPE_STAGE, XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR,
+                                                 XR_REFERENCE_SPACE_TYPE_COMBINED_EYE_VARJO};
+    TWO_CALL(cap, n, out, types, ((session *)h)->inst->foveated ? 5 : 4, out[i_] = types[i_]);
     return XR_SUCCESS;
 }
 
@@ -553,6 +598,9 @@ static XrResult xrCreateReferenceSpace_(XrSession h, const XrReferenceSpaceCreat
     case XR_REFERENCE_SPACE_TYPE_LOCAL:
     case XR_REFERENCE_SPACE_TYPE_STAGE:
     case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR: break;   // core in OpenXR 1.1
+    case XR_REFERENCE_SPACE_TYPE_COMBINED_EYE_VARJO:   // the gaze, with XR_VARJO_foveated_rendering
+        if (!((session *)h)->inst->foveated) return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+        break;
     default: return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     return new_space((session *)h, (space){.kind = SPACE_REFERENCE, .ref = info->referenceSpaceType,
@@ -633,6 +681,11 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked, spa
         } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR) {
             base = local_origin(sp->sess, t);   // LOCAL, dropped to the floor
             base.position.y = 0;
+        } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_COMBINED_EYE_VARJO) {
+            // The head turned along the gaze; while the eyes aren't tracked, the head itself.
+            axr_motion eyes = axr_device_motion(AXR_EYES, t);
+            *tracked = eyes.valid;
+            base = from_axr(eyes.valid ? eyes.pose : axr_device_motion(AXR_HEAD, t).pose);
         }
         *out = pmul(base, sp->offset);
         return true;
@@ -680,9 +733,15 @@ static XrResult locate(XrSpace hs, XrSpace hb, XrTime t, XrSpaceLocation *loc, X
 
 static XrResult xrLocateSpace_(XrSpace hs, XrSpace hb, XrTime t, XrSpaceLocation *loc) {
     XrSpaceVelocity *vel = NULL;
-    for (XrBaseOutStructure *n = loc->next; n; n = n->next)
+    XrEyeGazeSampleTimeEXT *sample = NULL;
+    for (XrBaseOutStructure *n = loc->next; n; n = n->next) {
         if (n->type == XR_TYPE_SPACE_VELOCITY) vel = (XrSpaceVelocity *)n;
-    return locate(hs, hb, t, loc, vel);
+        if (n->type == XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT) sample = (XrEyeGazeSampleTimeEXT *)n;
+    }
+    XrResult r = locate(hs, hb, t, loc, vel);
+    // The newest gaze sample is used for any time asked, so say it is that time.
+    if (sample) sample->time = loc->locationFlags ? (t ? t : axr_now_ns()) : 0;
+    return r;
 }
 
 static XrResult xrLocateSpaces_(XrSession h, const XrSpacesLocateInfo *info, XrSpaceLocations *out) {
@@ -711,12 +770,14 @@ static XrResult xrLocateViews_(XrSession h, const XrViewLocateInfo *info, XrView
                                uint32_t *n, XrView *views) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     CHECK_HANDLE(info->space, space, MAGIC_SPACE);
-    if (info->viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+    session *s = (session *)h;
+    if (!view_config_ok((XrInstance)s->inst, info->viewConfigurationType))
         return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     if (info->displayTime <= 0) return XR_ERROR_TIME_INVALID;
-    *n = 2;
+    bool quad = info->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO;
+    *n = quad ? 4 : 2;
     if (cap == 0) return XR_SUCCESS;
-    if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
+    if (cap < *n) return XR_ERROR_SIZE_INSUFFICIENT;
     XrPosef base;
     bool tracked;
     space_in_stage((space *)info->space, info->displayTime, &base, &tracked, NULL);
@@ -726,6 +787,19 @@ static XrResult xrLocateViews_(XrSession h, const XrViewLocateInfo *info, XrView
     for (int e = 0; e < 2; e++) {
         views[e].pose = pmul(head_in_base, from_axr(v.eye_in_head[e]));
         views[e].fov = (XrFovf){v.fov[e][0], v.fov[e][1], v.fov[e][2], v.fov[e][3]};
+    }
+    if (quad) {
+        // The insets: where the eyes look if the app asks for foveated rendering, else the middle.
+        bool gaze = false;
+        for (const XrBaseInStructure *x = info->next; x; x = x->next)
+            if (x->type == XR_TYPE_VIEW_LOCATE_FOVEATED_RENDERING_VARJO && s->inst->foveated)
+                gaze = ((const XrViewLocateFoveatedRenderingVARJO *)x)->foveatedRenderingActive;
+        float inset[2][4];
+        axr_foveated_inset(info->displayTime, gaze, inset);
+        for (int e = 0; e < 2; e++) {
+            views[2 + e].pose = views[e].pose;
+            views[2 + e].fov = (XrFovf){inset[e][0], inset[e][1], inset[e][2], inset[e][3]};
+        }
     }
     state->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
     if (axr_backend_connected())
@@ -898,15 +972,18 @@ static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
     if (!s->running) return XR_ERROR_SESSION_NOT_RUNNING;
     if (info->displayTime <= 0) return XR_ERROR_TIME_INVALID;
     if (info->environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
-    // The stream carries one picture per eye, so the first stereo projection layer is it.
+    // The stream carries one picture per eye, so the first stereo projection layer is it. With quad
+    // views it has four, and the insets go to the compositor with the field of view they were
+    // rendered with.
     for (uint32_t i = 0; i < info->layerCount; i++) {
         const XrCompositionLayerBaseHeader *l = info->layers[i];
         if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
         const XrCompositionLayerProjection *p = (const XrCompositionLayerProjection *)l;
         axr_stat_projection++;
-        if (p->viewCount != 2) return XR_ERROR_VALIDATION_FAILURE;
-        axr_eye_image eyes[2];
-        for (int e = 0; e < 2; e++) {
+        uint32_t views = s->view_config == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO ? 4 : 2;
+        if (p->viewCount != views) return XR_ERROR_VALIDATION_FAILURE;
+        axr_eye_image eyes[4];
+        for (uint32_t e = 0; e < views; e++) {
             const XrSwapchainSubImage *sub = &p->views[e].subImage;
             CHECK_HANDLE(sub->swapchain, swapchain, MAGIC_SWAPCHAIN);
             swapchain *sc = (swapchain *)sub->swapchain;
@@ -914,7 +991,19 @@ static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
             eyes[e] = (axr_eye_image){sc->images[sc->released], sub->imageArrayIndex, sub->imageRect.offset.x,
                                       sub->imageRect.offset.y, sub->imageRect.extent.width, sub->imageRect.extent.height};
         }
-        axr_submit(info->displayTime, eyes, s->queue);
+        if (views == 4) {
+            float inset[2][4];
+            for (int e = 0; e < 2; e++) {
+                const XrFovf *f = &p->views[2 + e].fov;
+                inset[e][0] = f->angleLeft;
+                inset[e][1] = f->angleRight;
+                inset[e][2] = f->angleUp;
+                inset[e][3] = f->angleDown;
+            }
+            axr_submit_quad(info->displayTime, eyes, inset, s->queue);
+        } else {
+            axr_submit(info->displayTime, eyes, s->queue);
+        }
         break;
     }
     return XR_SUCCESS;
@@ -927,6 +1016,10 @@ static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
 
 static NSString *const kTouch = @"/interaction_profiles/oculus/touch_controller";
 static NSString *const kSimple = @"/interaction_profiles/khr/simple_controller";
+// XR_EXT_eye_gaze_interaction: one pose, /user/eyes_ext/input/gaze_ext/pose, bound beside the
+// controllers' profile.
+static NSString *const kEyeGaze = @"/interaction_profiles/ext/eye_gaze_interaction";
+static NSString *const kEyes = @"/user/eyes_ext";
 
 static XrResult xrCreateActionSet_(XrInstance h, const XrActionSetCreateInfo *info, XrActionSet *out) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
@@ -1008,10 +1101,16 @@ static XrResult xrAttachSessionActionSets_(XrSession h, const XrSessionActionSet
         NSString *b = pair[1];
         [a->bindings addObject:profile == kSimple ? from_simple(b) : b];
     }
+    bool eyes = s->inst->eye_gaze && sug[kEyeGaze] != nil;
+    for (NSArray *pair in eyes ? sug[kEyeGaze] : @[]) {
+        action *a = [pair[0] pointerValue];
+        [a->bindings addObject:pair[1]];
+    }
     s->profile = profile ? path_for(profile) : XR_NULL_PATH;
     pthread_mutex_unlock(&g_lock);
-    axr_log("actions attached, profile %s", profile ? profile.UTF8String : "(none suggested)");
-    if (profile) {
+    axr_log("actions attached, profile %s%s", profile ? profile.UTF8String : "(none suggested)",
+            eyes ? (axr_eye_tracking() ? ", and eye gaze" : ", and eye gaze (no eye tracker yet)") : "");
+    if (profile || eyes) {
         for (NSString *hand in @[ @"/user/hand/left", @"/user/hand/right" ]) {
             XrEventDataInteractionProfileChanged ev = {XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED, NULL, h};
             (void)hand;
@@ -1029,6 +1128,8 @@ static XrResult xrGetCurrentInteractionProfile_(XrSession h, XrPath top, XrInter
     if (!t) return XR_ERROR_PATH_INVALID;
     if (!s->action_sets.count) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
     st->interactionProfile = [t hasPrefix:@"/user/hand/"] ? s->profile : XR_NULL_PATH;
+    if ([t isEqualToString:kEyes] && s->inst->eye_gaze && s->inst->suggested[kEyeGaze] && axr_eye_tracking())
+        st->interactionProfile = path_for(kEyeGaze);
     return XR_SUCCESS;
 }
 
@@ -1044,6 +1145,7 @@ static int sub_of_path(XrPath p, bool *ok) {
     NSString *s = path_string(p);
     if ([s isEqualToString:@"/user/hand/left"]) return SUB_LEFT;
     if ([s isEqualToString:@"/user/hand/right"]) return SUB_RIGHT;
+    if ([s isEqualToString:kEyes]) return SUB_NONE;
     *ok = false;
     return SUB_NONE;
 }
@@ -1100,8 +1202,10 @@ static XrResult xrSyncActions_(XrSession h, const XrActionsSyncInfo *info) {
             for (uint32_t i = 0; i < info->countActiveActionSets; i++)
                 synced |= (action_set *)info->activeActionSets[i].actionSet == a->set;
             if (!synced || a->type == XR_ACTION_TYPE_POSE_INPUT || a->type == XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+                // A gaze pose is active while the eye tracker reports.
+                bool gaze = a->bindings.count > 0 && [a->bindings.firstObject hasPrefix:kEyes];
                 for (int u = 0; u < SUB_COUNT; u++) {
-                    a->active[u] = synced && connected && a->bindings.count > 0;
+                    a->active[u] = synced && connected && a->bindings.count > 0 && (!gaze || axr_eye_tracking());
                     a->changed[u] = false;
                 }
                 continue;
@@ -1212,7 +1316,7 @@ static XrResult xrCreateActionSpace_(XrSession h, const XrActionSpaceCreateInfo 
     for (NSString *b in a->bindings) {
         int bu = sub_of(b);
         if (u != SUB_NONE && bu != u) continue;
-        hand = bu == SUB_LEFT ? AXR_LEFT : AXR_RIGHT;
+        hand = [b hasPrefix:kEyes] ? AXR_EYES : bu == SUB_LEFT ? AXR_LEFT : AXR_RIGHT;
         aim = [b hasSuffix:@"/aim/pose"];
         break;
     }
@@ -1265,10 +1369,11 @@ static XrResult xrGetInputSourceLocalizedName_(XrSession h, const XrInputSourceL
     NSString *p = path_string(info->sourcePath);
     if (!p) return XR_ERROR_PATH_INVALID;
     NSMutableArray *parts = [NSMutableArray array];
+    bool eyes = [p hasPrefix:kEyes];
     if (info->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT)
-        [parts addObject:[p containsString:@"/left"] ? @"Left Hand" : @"Right Hand"];
+        [parts addObject:eyes ? @"Eyes" : [p containsString:@"/left"] ? @"Left Hand" : @"Right Hand"];
     if (info->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT)
-        [parts addObject:@"PS VR2 Sense (as Touch)"];
+        [parts addObject:eyes ? @"PS VR2 Eye Tracking" : @"PS VR2 Sense (as Touch)"];
     if (info->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT)
         [parts addObject:[p componentsSeparatedByString:@"/input/"].lastObject ?: p];
     return copy_string([parts componentsJoinedByString:@" "].UTF8String, cap, n, buf);

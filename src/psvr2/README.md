@@ -8,5 +8,8 @@ Headset access for the PS VR2 backend (`src/backend_psvr2.m`), taken unchanged f
 - `fusion.c`, `fusion.h`: gyro integration corrected toward the SLAM poses.
 - `lut.c`: the lens distortion and chromatic aberration table.
 
+`cpsvr2.c` has since gained the eye tracker (gaze stream, calibration commands, saving and
+re-sending the user calibration), from PSVR2Toolkit and Monado's `psvr2_eye.c`.
+
 The protocol, distortion formulas and table are Monado's (Boost Software License 1.0); the
 rest is psvr2-player-mac's (MIT). See `LICENSE` and `THIRD-PARTY.md` here.

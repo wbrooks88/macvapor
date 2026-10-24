@@ -12,6 +12,11 @@
 // and orientation, placed by an arm model, since their position needs camera tracking that no open
 // code does on a Mac yet. A double press of the headset's button shows the room through its
 // front cameras in place of the game, and another goes back.
+//
+// The headset's eye tracker comes over the same USB (cpsvr2.c): games that ask for eye gaze get it
+// (XR_EXT_eye_gaze_interaction), games that render quad views get a sharp inset that follows the
+// eyes and a cheap low-resolution rest (foveated rendering), and holding Fn for two seconds runs
+// the eye tracker's own calibration, drawn by the compositor over whatever is showing.
 
 #import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -85,11 +90,18 @@ typedef struct {
     bool reprojection;    // turn each frame by the head's rotation since it was rendered
     bool positional;      // experimental: the headset's SLAM position instead of the neck model
     bool controllers;     // the Sense controllers over Bluetooth
+    bool eye_tracking;    // the headset's eye tracker
+    bool show_gaze;       // a ring where the eyes look, to check the eye tracker
+    bool foveated;        // offer quad views (a gaze-following sharp inset) to games that use them
+    float foveated_area_deg;     // width and height of the inset
+    float foveated_outer_scale;  // the rest of the view's resolution, as a share of render_scale's
+    float foveated_inset_scale;  // the inset's resolution, as a share of the panel's at its centre
 } config;
 
 static NSString *g_config_dir;
 static config g_cfg = {.render_scale = 0.75f, .eye_height = 1.6f, .chromatic = true, .reprojection = true,
-                       .controllers = true};
+                       .controllers = true, .eye_tracking = true, .foveated = true, .foveated_area_deg = 40,
+                       .foveated_outer_scale = 0.5f, .foveated_inset_scale = 1.0f};
 
 static void read_config(void) {
     NSString *path = [g_config_dir stringByAppendingPathComponent:@"config.json"];
@@ -100,7 +112,10 @@ static void read_config(void) {
             @"render_scale" : @(g_cfg.render_scale), @"eye_height" : @(g_cfg.eye_height),
             @"lookahead_ms" : @(g_cfg.lookahead_ms), @"chromatic" : @(g_cfg.chromatic),
             @"reprojection" : @(g_cfg.reprojection), @"positional" : @(g_cfg.positional),
-            @"controllers" : @(g_cfg.controllers),
+            @"controllers" : @(g_cfg.controllers), @"eye_tracking" : @(g_cfg.eye_tracking),
+            @"show_gaze" : @(g_cfg.show_gaze), @"foveated" : @(g_cfg.foveated),
+            @"foveated_area_deg" : @(g_cfg.foveated_area_deg), @"foveated_outer_scale" : @(g_cfg.foveated_outer_scale),
+            @"foveated_inset_scale" : @(g_cfg.foveated_inset_scale),
         };
         [[NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
             writeToFile:path atomically:YES];
@@ -115,11 +130,22 @@ static void read_config(void) {
     if (c[@"reprojection"]) g_cfg.reprojection = [c[@"reprojection"] boolValue];
     if (c[@"positional"]) g_cfg.positional = [c[@"positional"] boolValue];
     if (c[@"controllers"]) g_cfg.controllers = [c[@"controllers"] boolValue];
+    if (c[@"eye_tracking"]) g_cfg.eye_tracking = [c[@"eye_tracking"] boolValue];
+    if (c[@"show_gaze"]) g_cfg.show_gaze = [c[@"show_gaze"] boolValue];
+    if (c[@"foveated"]) g_cfg.foveated = [c[@"foveated"] boolValue];
+    if (c[@"foveated_area_deg"]) g_cfg.foveated_area_deg = fmaxf(15, fminf(80, [c[@"foveated_area_deg"] floatValue]));
+    if (c[@"foveated_outer_scale"])
+        g_cfg.foveated_outer_scale = fmaxf(0.2f, fminf(1, [c[@"foveated_outer_scale"] floatValue]));
+    if (c[@"foveated_inset_scale"])
+        g_cfg.foveated_inset_scale = fmaxf(0.3f, fminf(1.5f, [c[@"foveated_inset_scale"] floatValue]));
     axr_log("config: render scale %.2f, eye height %.2f m, lookahead %+.1f ms, chromatic %s, reprojection %s, %s,"
             " controllers %s",
             g_cfg.render_scale, g_cfg.eye_height, g_cfg.lookahead_ms, g_cfg.chromatic ? "on" : "off",
             g_cfg.reprojection ? "on" : "off", g_cfg.positional ? "SLAM position (experimental)" : "neck model",
             g_cfg.controllers ? "on" : "off");
+    axr_log("config: eye tracking %s, gaze ring %s, foveated rendering %s (inset %.0f deg at %.2f, rest at %.2f)",
+            g_cfg.eye_tracking ? "on" : "off", g_cfg.show_gaze ? "on" : "off", g_cfg.foveated ? "offered" : "off",
+            g_cfg.foveated_area_deg, g_cfg.foveated_inset_scale, g_cfg.foveated_outer_scale);
 }
 
 // --------------------------------------------------------------------------------- quaternions
@@ -189,7 +215,9 @@ static unsigned g_pose_next;
 // so axr_submit copies each frame here on the game's queue; the compositor reads the newest.
 enum { SLOTS = 3 };
 static struct {
-    id<MTLTexture> eye[2];
+    id<MTLTexture> eye[4];         // left, right, and with quad views the left and right insets
+    bool quad;
+    float inset_fov[2][4];         // the insets' field of view (left, right, up, down)
     quat q;                        // the head orientation the frame was rendered with
     int readers;                   // compositor passes in flight
     bool pending;                  // copy in flight
@@ -224,10 +252,15 @@ static uint64_t g_last_composed_seq;
 typedef struct {
     float calib_l[4], calib_r[4];
     float delta[16];
-    float p0[4];
-    float p1[4];
+    float p0[4];          // a frame, chromatic, quad insets, gaze ring
+    float p1[4];          // passthrough
+    float cal[4];         // calibration target in the head (m), mode: 0 off, 1 dark, 2 light
+    float cal2[4];        // half the IPD (m), seconds since the target appeared
+    float gaze[4];        // gaze direction in the head, valid
+    float inset_l[4];     // tangents of the insets' field of view: left, right, up, down
+    float inset_r[4];
 } compose_uniform;
-_Static_assert(sizeof(compose_uniform) == 128, "Uni layout");
+_Static_assert(sizeof(compose_uniform) == 208, "Uni layout");
 
 id<MTLDevice> axr_metal_device(void) {
     static dispatch_once_t once;
@@ -399,7 +432,244 @@ static axr_motion hand_motion(int hand, int64_t time) {
     return m;
 }
 
+// ------------------------------------------------------------------------------------------ eyes
+//
+// The eye tracker's combined gaze, smoothed by a one-euro filter (little smoothing while the eyes
+// move fast, so the inset keeps up with a glance, more while they rest, so it doesn't shimmer),
+// and held through a blink for a moment.
+
+static pthread_mutex_t g_eye_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_eyes_on;             // the eye tracker started
+static NSString *g_eye_calibration_path;
+static struct {
+    unsigned frame;                // the last gaze frame filtered
+    bool have;
+    float dir[3], rate[3];         // filtered direction, and its filtered rate of change
+    double t, valid_t;             // when that frame arrived; the last valid one
+} g_eye;
+
+// Calibration targets, drawn by the compositor while the calibration runs (calibration_thread).
+static struct {
+    int mode;                      // 0 none, 1 dark background, 2 light background
+    float target[3];               // in the head, metres (x right, y up, -z forward)
+    int64_t shown_ns;
+    bool running;
+} g_cal;
+
+static float euro_alpha(float cutoff_hz, float dt) {
+    float tau = 1.0f / (2 * (float)M_PI * cutoff_hz);
+    return 1.0f / (1.0f + tau / dt);
+}
+
+// Where the eyes look, as a unit vector in the head (x right, y up, -z forward). False without
+// a recent valid sample.
+static bool gaze_in_head(float out[3]) {
+    if (!g_eyes_on) return false;
+    psvr2_gaze g;
+    if (psvr2_get_gaze(&g) != 1) return false;
+    double now = axr_now_ns() / 1e9;
+    pthread_mutex_lock(&g_eye_lock);
+    if (g.valid && g.frame != g_eye.frame) {
+        double t = now - g.age_s;
+        if (!g_eye.have || t - g_eye.t > 0.25) {
+            memcpy(g_eye.dir, g.dir, sizeof g_eye.dir);
+            memset(g_eye.rate, 0, sizeof g_eye.rate);
+        } else {
+            float dt = fmaxf(0.001f, (float)(t - g_eye.t)), speed = 0, n = 0;
+            float ar = euro_alpha(1.0f, dt);
+            for (int i = 0; i < 3; i++) {
+                g_eye.rate[i] += ar * ((g.dir[i] - g_eye.dir[i]) / dt - g_eye.rate[i]);
+                speed += g_eye.rate[i] * g_eye.rate[i];
+            }
+            float a = euro_alpha(2.0f + 2.0f * sqrtf(speed), dt);   // 2 Hz at rest, faster when moving
+            for (int i = 0; i < 3; i++) {
+                g_eye.dir[i] += a * (g.dir[i] - g_eye.dir[i]);
+                n += g_eye.dir[i] * g_eye.dir[i];
+            }
+            n = sqrtf(n);
+            for (int i = 0; i < 3 && n > 0; i++) g_eye.dir[i] /= n;
+        }
+        g_eye.frame = g.frame;
+        g_eye.t = g_eye.valid_t = t;
+        g_eye.have = true;
+    }
+    bool ok = g_eye.have && now - g_eye.valid_t < 0.3;
+    if (ok) memcpy(out, g_eye.dir, sizeof g_eye.dir);
+    pthread_mutex_unlock(&g_eye_lock);
+    return ok;
+}
+
+// The rotation that turns -Z to look along d, without roll.
+static quat look_along(const float d[3]) {
+    float yaw = atan2f(-d[0], -d[2]), pitch = asinf(fmaxf(-1, fminf(1, d[1])));
+    return qnorm(qmul(qyaw(yaw), (quat){sinf(pitch / 2), 0, 0, cosf(pitch / 2)}));
+}
+
+bool axr_backend_has_eye_tracker(void) { return true; }
+
+bool axr_eye_tracking(void) { return g_eyes_on; }
+
+// The eye tracker's calibration, as PSVR2Toolkit.UnitySetup runs it: 8 targets on a dark
+// background (5 far, 3 near), the headset computes, then 5 on a light one, and it computes again.
+// Targets are in millimetres in the eye tracker's axes (x left, y up, +z ahead). At the end the
+// headset is asked to report the result, which cpsvr2.c saves to send again on the next start.
+static const float k_cal_points[][3] = {
+    {0, 0, 2000},    {-400, 400, 2000}, {400, -400, 2000}, {400, 400, 2000}, {-400, -400, 2000},
+    {0, 0, 300},     {-100, 0, 300},    {100, 0, 300},
+    {0, 0, 2000},    {-1000, 0, 2000},  {1000, 0, 2000},   {0, 1000, 2000},  {0, -1000, 2000},
+};
+enum { CAL_POINTS = sizeof k_cal_points / sizeof k_cal_points[0], CAL_LIGHT_FROM = 8 };
+
+static void cal_show(int mode, const float mm[3]) {
+    pthread_mutex_lock(&g_eye_lock);
+    g_cal.mode = mode;
+    if (mm) {
+        g_cal.target[0] = -mm[0] / 1000;
+        g_cal.target[1] = mm[1] / 1000;
+        g_cal.target[2] = -mm[2] / 1000;
+    }
+    g_cal.shown_ns = axr_now_ns();
+    pthread_mutex_unlock(&g_eye_lock);
+}
+
+static void sleep_s(double s) {
+    struct timespec d = {(time_t)s, (long)((s - (time_t)s) * 1e9)};
+    nanosleep(&d, NULL);
+}
+
+// Polls the eye tracker for up to timeout_s: a collected point (result OK), or a finished compute
+// (status OK or failed). Returns 1 on success, 0 on failure, -1 on timeout.
+static int cal_wait(bool compute, double timeout_s) {
+    for (double t = 0; t < timeout_s; t += 0.05) {
+        sleep_s(0.05);
+        int status = 0, result = 0;
+        if (psvr2_gaze_calibration_status(&status, &result) != 0) continue;
+        if (!compute && result == PSVR2_GAZE_RESULT_OK) return 1;
+        if (compute && status == PSVR2_GAZE_STATUS_COMPUTE_OK) return 1;
+        if (compute && status == PSVR2_GAZE_STATUS_COMPUTE_FAILED) return 0;
+    }
+    return -1;
+}
+
+static void *calibration_thread(void *arg) {
+    (void)arg;
+    axr_log("eye calibration: look at each dot until the next one appears");
+    psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_SET_EYE, 0, 0, 0, 2);
+    psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_START, 0, 0, 0, 0);
+    bool ok = true;
+    for (int i = 0; i < CAL_POINTS && ok; i++) {
+        const float *pt = k_cal_points[i];
+        cal_show(i < CAL_LIGHT_FROM ? 1 : 2, pt);
+        sleep_s(1.0);   // time to find the dot and settle on it
+        psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_COLLECT, pt[0], pt[1], pt[2], 0);
+        int r = cal_wait(false, 10);
+        if (r != 1) {
+            axr_log("eye calibration: point %d %s", i + 1, r < 0 ? "timed out" : "failed");
+            ok = false;
+            break;
+        }
+        bool stage_end = i == CAL_LIGHT_FROM - 1 || i == CAL_POINTS - 1;
+        if (!stage_end) continue;
+        psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_COMPUTE, 0, 0, 0, 0);
+        r = cal_wait(true, 10);
+        if (r != 1) {
+            axr_log("eye calibration: the headset's compute after point %d %s", i + 1, r < 0 ? "timed out" : "failed");
+            ok = false;
+            break;
+        }
+        if (i == CAL_LIGHT_FROM - 1) {
+            axr_log("eye calibration: dark stage done");
+            cal_show(2, k_cal_points[CAL_LIGHT_FROM]);   // the eyes adjust to the light first
+            sleep_s(2.0);
+        }
+    }
+    cal_show(0, NULL);
+    psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_STOP, 0, 0, 0, 0);
+    psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_SET_EYE, 0, 0, 0, 2);
+    psvr2_gaze_calibration_command(PSVR2_GAZE_CAL_RETRIEVE, 0, 0, 0, 0);
+    if (ok) {
+        double age = -1;
+        for (int t = 0; t < 30; t++) {
+            sleep_s(0.1);
+            age = psvr2_gaze_calibration_saved_age();
+            if (age >= 0 && age < 4) break;
+        }
+        axr_log("eye calibration succeeded%s", age >= 0 && age < 4 ? "; saved, and sent again on every start"
+                                                                    : ", but the headset did not report it to save;"
+                                                                      " it holds until the headset turns off");
+    } else {
+        axr_log("eye calibration did not finish; hold Fn for 2 seconds to try again");
+    }
+    pthread_mutex_lock(&g_eye_lock);
+    g_cal.running = false;
+    pthread_mutex_unlock(&g_eye_lock);
+    return NULL;
+}
+
+// Starts the calibration unless it is running or there is no eye tracker.
+void axr_eye_calibrate(void) {
+    pthread_mutex_lock(&g_eye_lock);
+    bool start = g_eyes_on && !g_cal.running;
+    if (start) g_cal.running = true;
+    pthread_mutex_unlock(&g_eye_lock);
+    if (!start) {
+        if (!g_eyes_on) axr_log("eye calibration: the eye tracker is off or not found");
+        return;
+    }
+    pthread_t t;
+    pthread_create(&t, NULL, calibration_thread, NULL);
+    pthread_detach(t);
+}
+
+// --------------------------------------------------------------------------- foveated rendering
+
+// The game's eye images cover this tan-space rectangle (see axr_current_views).
+static const float k_FX = 0.3585564f, k_FY = 0.3762281f, k_CX = 0.6603788f;
+
+bool axr_foveated_supported(void) { return g_cfg.foveated; }
+
+void axr_foveated_sizes(uint32_t outer[2], uint32_t inset[2]) {
+    float s = g_cfg.render_scale * g_cfg.foveated_outer_scale;
+    float t = 2 * tanf(g_cfg.foveated_area_deg / 2 * (float)M_PI / 180) * g_cfg.foveated_inset_scale;
+    outer[0] = (uint32_t)MAX(16, lroundf(2000 * s / 16) * 16);
+    outer[1] = (uint32_t)MAX(16, lroundf(1906 * s / 16) * 16);
+    // The panel has 2000 * FX pixels per unit of tangent at its centre, across and down.
+    inset[0] = (uint32_t)MAX(16, lroundf(2000 * k_FX * t / 16) * 16);
+    inset[1] = (uint32_t)MAX(16, lroundf(1906 * k_FY * t / 16) * 16);
+}
+
+void axr_foveated_inset(int64_t time, bool gaze, float fov[2][4]) {
+    (void)time;   // the newest gaze: the eyes move too fast and too suddenly to predict
+    axr_views v = axr_current_views();
+    float half = g_cfg.foveated_area_deg / 2 * (float)M_PI / 180, ax = 0, ay = 0, d[3];
+    if (gaze && gaze_in_head(d) && d[2] < -0.2f) {
+        ax = atanf(d[0] / -d[2]);
+        ay = atanf(d[1] / -d[2]);
+    }
+    // Moved, not shrunk, to stay inside the eye's view.
+    for (int e = 0; e < 2; e++) {
+        float cx = fmaxf(v.fov[e][0] + half, fminf(v.fov[e][1] - half, ax));
+        float cy = fmaxf(v.fov[e][3] + half, fminf(v.fov[e][2] - half, ay));
+        fov[e][0] = cx - half;
+        fov[e][1] = cx + half;
+        fov[e][2] = cy + half;
+        fov[e][3] = cy - half;
+    }
+}
+
 axr_motion axr_device_motion(int device, int64_t time) {
+    if (device == AXR_EYES) {
+        axr_motion m = {0};
+        float d[3];
+        if (!gaze_in_head(d)) return m;
+        quat q = pose_for(time);
+        m.pose = head_pose(q);
+        quat o = qnorm(qmul(q, look_along(d)));
+        m.pose.orientation[0] = o.x; m.pose.orientation[1] = o.y;
+        m.pose.orientation[2] = o.z; m.pose.orientation[3] = o.w;
+        m.valid = true;
+        return m;
+    }
     if (device == AXR_LEFT) return hand_motion(SENSE_LEFT, time);
     if (device == AXR_RIGHT) return hand_motion(SENSE_RIGHT, time);
     axr_motion m = {0};
@@ -416,7 +686,7 @@ axr_motion axr_device_motion(int device, int64_t time) {
 // The game's eye images cover the tan-space rectangle the compositor reads (psvr2_compose.metal):
 // x from -cx / FX to (1 - cx) / FX, y from -0.5 / FY to 0.5 / FY, with the wider side outwards.
 axr_views axr_current_views(void) {
-    const float FX = 0.3585564f, FY = 0.3762281f, cx = 0.6603788f;
+    const float FX = k_FX, FY = k_FY, cx = k_CX;
     int prox = 0, ipd_mm = 63;
     if (g_usb) psvr2_get_status(&prox, &ipd_mm);
     if (ipd_mm < 55 || ipd_mm > 75) ipd_mm = 63;
@@ -542,7 +812,9 @@ int64_t axr_wait_frame(void) {
 
 // ---------------------------------------------------------------------------------- submission
 
-void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommandQueue> queue) {
+// Copies n eye images (2, or 4 with quad views) into a free slot.
+static void submit_views(int64_t display_time, const axr_eye_image *eyes, int n, const float inset_fov[2][4],
+                         id<MTLCommandQueue> queue) {
     quat q = pose_for(display_time);
     pthread_mutex_lock(&g_lock);
     g_stat_submits++;
@@ -554,7 +826,9 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
     pthread_mutex_unlock(&g_lock);
 
     // Only this thread touches a pending slot's textures.
-    for (int e = 0; e < 2; e++) {
+    g_slots[s].quad = n == 4;
+    if (inset_fov) memcpy(g_slots[s].inset_fov, inset_fov, sizeof g_slots[s].inset_fov);
+    for (int e = 0; e < n; e++) {
         id<MTLTexture> src = eyes[e].texture, dst = g_slots[s].eye[e];
         if (!dst || dst.width != (NSUInteger)eyes[e].width || dst.height != (NSUInteger)eyes[e].height ||
             dst.pixelFormat != src.pixelFormat) {
@@ -565,12 +839,13 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
             d.usage = MTLTextureUsageShaderRead;
             d.storageMode = MTLStorageModePrivate;
             g_slots[s].eye[e] = [axr_metal_device() newTextureWithDescriptor:d];
-            axr_log("eye %d images: %dx%d, format %lu", e, eyes[e].width, eyes[e].height, (unsigned long)src.pixelFormat);
+            axr_log("%s %d images: %dx%d, format %lu", e < 2 ? "eye" : "inset", e % 2, eyes[e].width, eyes[e].height,
+                    (unsigned long)src.pixelFormat);
         }
     }
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-    for (int e = 0; e < 2; e++)
+    for (int e = 0; e < n; e++)
         [blit copyFromTexture:eyes[e].texture sourceSlice:eyes[e].slice sourceLevel:0
                  sourceOrigin:MTLOriginMake(eyes[e].x, eyes[e].y, 0)
                    sourceSize:MTLSizeMake(eyes[e].width, eyes[e].height, 1)
@@ -588,6 +863,15 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
         pthread_mutex_unlock(&g_lock);
     }];
     [cmd commit];
+}
+
+void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommandQueue> queue) {
+    submit_views(display_time, eyes, 2, NULL, queue);
+}
+
+void axr_submit_quad(int64_t display_time, const axr_eye_image eyes[4], const float inset_fov[2][4],
+                     id<MTLCommandQueue> queue) {
+    submit_views(display_time, eyes, 4, inset_fov, queue);
 }
 
 // ---------------------------------------------------------------------------------- compositor
@@ -628,12 +912,18 @@ static void compose(int64_t scanout) {
     pthread_mutex_lock(&g_lock);
     int s = g_latest;
     quat rendered = QID;
-    id<MTLTexture> left = nil, right = nil;
+    id<MTLTexture> left = nil, right = nil, inset_left = nil, inset_right = nil;
+    float inset_fov[2][4] = {{0}};
     if (s >= 0) {
         g_slots[s].readers++;
         rendered = g_slots[s].q;
         left = g_slots[s].eye[0];
         right = g_slots[s].eye[1];
+        if (g_slots[s].quad) {
+            inset_left = g_slots[s].eye[2];
+            inset_right = g_slots[s].eye[3];
+            memcpy(inset_fov, g_slots[s].inset_fov, sizeof inset_fov);
+        }
         if (g_slots[s].seq == g_last_composed_seq) g_stat_repeated++;
         g_last_composed_seq = g_slots[s].seq;
     }
@@ -649,10 +939,31 @@ static void compose(int64_t scanout) {
     compose_uniform u = {
         .calib_l = {g_calib[0], g_calib[1], g_calib[4], g_calib[5]},
         .calib_r = {g_calib[2], g_calib[3], g_calib[6], g_calib[7]},
-        .p0 = {s >= 0 ? 1 : 0, g_cfg.chromatic ? 1 : 0, 0, 0},
+        .p0 = {s >= 0 ? 1 : 0, g_cfg.chromatic ? 1 : 0, inset_left && inset_right ? 1 : 0, 0},
         .p1 = {cameras ? 1 : 0, 150.0f * (float)M_PI / 180.0f, 1.6f, 0.100f},
     };
     qmatrix(turned ? qnorm(qmul(qconj(rendered), now)) : QID, u.delta);
+    for (int k = 0; k < 4; k++) {
+        u.inset_l[k] = tanf(inset_fov[0][k]);
+        u.inset_r[k] = tanf(inset_fov[1][k]);
+    }
+    float gaze[3];
+    if (g_cfg.show_gaze && gaze_in_head(gaze)) {
+        memcpy(u.gaze, gaze, sizeof gaze);
+        u.p0[3] = 1;
+    }
+    pthread_mutex_lock(&g_eye_lock);
+    if (g_cal.mode) {
+        memcpy(u.cal, g_cal.target, sizeof g_cal.target);
+        u.cal[3] = g_cal.mode;
+        u.cal2[1] = (axr_now_ns() - g_cal.shown_ns) / 1e9f;
+    }
+    pthread_mutex_unlock(&g_eye_lock);
+    if (u.cal[3] > 0) {
+        int prox = 0, ipd_mm = 63;
+        if (g_usb) psvr2_get_status(&prox, &ipd_mm);
+        u.cal2[0] = (ipd_mm < 55 || ipd_mm > 75 ? 63 : ipd_mm) / 2000.0f;
+    }
 
     id<CAMetalDrawable> drawable = [layer nextDrawable];
     id<MTLCommandBuffer> cmd = drawable ? [g_queue commandBuffer] : nil;
@@ -675,6 +986,8 @@ static void compose(int64_t scanout) {
     [enc setFragmentTexture:right ?: g_blank atIndex:1];
     [enc setFragmentTexture:cameras ? g_cam[0] : g_blank atIndex:2];
     [enc setFragmentTexture:cameras ? g_cam[1] : g_blank atIndex:3];
+    [enc setFragmentTexture:inset_left ?: g_blank atIndex:4];
+    [enc setFragmentTexture:inset_right ?: g_blank atIndex:5];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
     [cmd presentDrawable:drawable];
@@ -803,8 +1116,8 @@ static void toggle_passthrough(void) {
 
 static void *status_thread(void *arg) {
     (void)arg;
-    bool was_down = false, recentered = false, ps_down[2] = {false, false};
-    int64_t connected_since = 0, last_stats = axr_now_ns(), last_press = 0;
+    bool was_down = false, recentered = false, ps_down[2] = {false, false}, cal_asked = false;
+    int64_t connected_since = 0, last_stats = axr_now_ns(), last_press = 0, down_since = 0;
     for (;;) {
         struct timespec d = {0, 50000000};
         nanosleep(&d, NULL);
@@ -820,7 +1133,8 @@ static void *status_thread(void *arg) {
                 g_tracking_ready = true;
                 pthread_mutex_unlock(&g_lock);
             }
-            // A press recenters; a second within 0.45 s also turns the cameras on or off
+            // A press recenters; a second within 0.45 s also turns the cameras on or off, and
+            // holding it for two seconds calibrates the eye tracker.
             bool down = psvr2_get_button() == 1;
             if (down && !was_down) {
                 recenter();
@@ -830,6 +1144,12 @@ static void *status_thread(void *arg) {
                 } else {
                     last_press = now;
                 }
+                down_since = now;
+                cal_asked = false;
+            }
+            if (down && !cal_asked && now - down_since > 2000000000LL) {
+                cal_asked = true;
+                axr_eye_calibrate();
             }
             was_down = down;
         }
@@ -885,6 +1205,20 @@ static void *status_thread(void *arg) {
                         s.charging ? " charging" : "", s.buttons, s.stick[0], s.stick[1], s.trigger, e[0], e[1], e[2],
                         s.updated_ns && axr_now_ns() - (int64_t)s.updated_ns < 1000000000 ? "reporting" : "NOT reporting");
             }
+            if (g_eyes_on) {
+                psvr2_gaze g;
+                unsigned packets = psvr2_gaze_packets();
+                float d[3] = {0};
+                bool looking = gaze_in_head(d);
+                if (psvr2_get_gaze(&g) == 1)
+                    axr_log("eyes: %.0f samples/s, %s, looking (%.2f, %.2f, %.2f), pupils %.1f/%.1f mm, blink %d/%d,"
+                            " user calibration %u%s",
+                            packets / dt, looking ? "tracked" : "NOT tracked", d[0], d[1], d[2], g.pupil_mm[0],
+                            g.pupil_mm[1], g.blink[0], g.blink[1], g.calibration_id,
+                            g.calibration_id ? "" : " (none: hold Fn for 2 s to calibrate)");
+                else
+                    axr_log("eyes: no samples from the eye tracker yet");
+            }
             axr_stat_wait = axr_stat_end = axr_stat_projection = 0;
             axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
         }
@@ -904,6 +1238,7 @@ void axr_backend_start(void) {
     NSString *env = NSProcessInfo.processInfo.environment[@"PSVR2XR_CONFIG_DIR"];
     g_config_dir = env ?: [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/psvr2xr"];
     read_config();
+    if (getenv("PSVR2XR_SHOW_GAZE")) g_cfg.show_gaze = true;   // the self-test's eye checks
 
     if (psvr2_start() == 0) {
         g_usb = true;
@@ -911,6 +1246,13 @@ void axr_backend_start(void) {
         psvr2_set_brightness(1.0f);
         axr_log("PS VR2 on USB; distortion calibration %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f", g_calib[0],
                 g_calib[1], g_calib[2], g_calib[3], g_calib[4], g_calib[5], g_calib[6], g_calib[7]);
+        if (g_cfg.eye_tracking) {
+            g_eye_calibration_path = [g_config_dir stringByAppendingPathComponent:@"eye_calibration.bin"];
+            bool saved = [NSFileManager.defaultManager fileExistsAtPath:g_eye_calibration_path];
+            g_eyes_on = psvr2_gaze_start(g_eye_calibration_path.fileSystemRepresentation) == 0;
+            axr_log(g_eyes_on ? "eye tracker on%s" : "eye tracker not available%s",
+                    !g_eyes_on ? "" : saved ? ", with your saved calibration" : "; hold Fn for 2 s to calibrate it");
+        }
     } else {
         axr_log("PS VR2 not found on USB (is the adapter's USB cable in, and no other app using the headset?);"
                 " showing frames without head tracking");
