@@ -1386,9 +1386,17 @@ static void make_window(void) {
     g_window = w;
     g_layer = layer;
     NSSize px = [screen convertRectToBacking:screen.frame].size;
+    // A headset that offers no panel-sized mode is in its flat cinema mode: it shows the whole
+    // 1080p frame, both eyes' halves, on one virtual screen, and no setting in Displays fixes it.
+    bool vr_modes = false;
+    NSArray *modes = (__bridge_transfer NSArray *)CGDisplayCopyAllDisplayModes(g_display, NULL);
+    for (id m in modes)
+        if (CGDisplayModeGetPixelWidth((__bridge CGDisplayModeRef)m) >= 2000) vr_modes = true;
     axr_log("headset window up: desktop %.0fx%.0f (%.0fx%.0f px)%s", screen.frame.size.width,
             screen.frame.size.height, px.width, px.height,
-            px.width == 4000 || px.width == 2000 ? "" : "; set PS VR2 to 2000x1020 or 4000x2040 in Displays for a sharper image");
+            !vr_modes ? "; the headset offers only 1080p modes, so it is in cinema mode and both eyes see "
+                        "one flat screen: power-cycle the PC adapter, or try a 4-lane DisplayPort 1.4 cable"
+            : px.width == 4000 || px.width == 2000 ? "" : "; set PS VR2 to 2000x1020 or 4000x2040 in Displays for a sharper image");
 }
 
 // The window has to be made on the main thread. Under Wine that thread runs the Cocoa event loop
