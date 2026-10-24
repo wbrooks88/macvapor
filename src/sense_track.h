@@ -23,7 +23,8 @@
 extern "C" {
 #endif
 
-enum { STRACK_CAMERAS = 2, STRACK_MAX_BLOBS = 48, STRACK_LEDS = 17 };
+// Cameras: lower left, lower right, upper left, upper right.
+enum { STRACK_CAMERAS = 4, STRACK_MAX_BLOBS = 48, STRACK_LEDS = 17 };
 
 // A fisheye camera: Kannala-Brandt's model, r = f (t + k1 t^3 + k2 t^5 + k3 t^7 + k4 t^9) pixels
 // from (cx, cy) for a ray t radians off the lens axis. Pixels are those of the full 1016-pixel frame.
@@ -35,10 +36,12 @@ typedef struct {
     float yaw_deg;          // + turns the lens to the left
     float pitch_deg;        // + tilts it up
     float roll_deg;         // + turns the picture counterclockwise
+    bool off;               // not used (no model of it yet)
 } strack_camera;
 
-// The cameras as fitted to a capture from a real headset: at the front corners of the visor, turned
-// about 12 degrees out and 28 down, seeing about 150 degrees across.
+// The cameras: the lower pair as fitted to a capture from a real headset, at the front corners of
+// the visor, turned about 12 degrees out and 28 down, seeing about 150 degrees across; the upper
+// pair a guess, off.
 void strack_default_cameras(strack_camera out[STRACK_CAMERAS]);
 
 typedef struct {
@@ -96,6 +99,11 @@ void strack_destroy(strack *t);
 int strack_detect_bc4(strack *t, int cam, const uint8_t *bc4, int stride_blocks);
 // The same from 8-bit grey pixels (tests, captures).
 int strack_detect_gray(strack *t, int cam, const uint8_t *pixels, int stride);
+// From a half-size 8-bit picture (the headset's tracking mode, width by height); the dots come out
+// in the full frame's pixels, as the camera model has them. Nothing for a camera that is off.
+int strack_detect_half(strack *t, int cam, const uint8_t *pixels, int width, int height, int stride);
+// No picture from this camera this frame.
+void strack_no_picture(strack *t, int cam);
 const strack_blob *strack_blobs(const strack *t, int cam, int *count);
 
 // The controllers' poses from the dots found in this frame's cameras.

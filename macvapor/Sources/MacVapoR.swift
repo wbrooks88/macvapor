@@ -474,7 +474,7 @@ final class Model: ObservableObject {
             case .foveated:
                 output = "Foveated test: the test room, with the sharp area tinted orange. It should follow your eyes, with a yellow ring where you look."
             case .captureControllers:
-                output = "Controller capture: the test room, while camera frames are saved to the PS VR2 Controller Capture folder on your Desktop. Hold both controllers in front of you and move them around slowly for 10 seconds, then press Stop and send Claude that folder as a zip."
+                output = "Controller capture: the test room, while camera frames are saved to the PS VR2 Controller Capture folder on your Desktop. Hold both controllers in front of you and move them around slowly for 20 seconds, raising them over your head too, then press Stop and send Claude that folder as a zip."
             default:
                 output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
             }

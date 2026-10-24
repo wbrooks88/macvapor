@@ -23,8 +23,11 @@
 #define STATUS_ENDPOINT 0x88
 #define CAMERA_INTERFACE 6
 #define CAMERA_ENDPOINT 0x87
-/* Camera frame header ('V','I'), followed by two BC4 planes */
+/* Camera frame header ('V','I'), followed by two BC4 planes (mode 0x10) or two 8-bit pictures
+ * (mode 4). Modes from Monado's psvr2_protocol.h (BSL-1.0). */
 #define CAMERA_HEADER_BYTES 256
+#define CAMERA_MODE_TRACKING 4
+#define CAMERA_MODE_BC4 0x10
 
 #define GYRO_SCALE (2000.0f / 32767.0f)
 #define DEG_TO_RAD(d) ((d) * (float)M_PI / 180.0f)
@@ -91,11 +94,16 @@ static volatile int g_camera_running;
 static unsigned char *g_camera_frame; /* two BC4 planes back to back */
 static int g_camera_seq;              /* grows with every received frame */
 static int g_camera_seq_taken;
-/* The cameras run while anyone wants them: passthrough, controller tracking or both */
+/* The cameras run while anyone wants them: passthrough, controller tracking or both. Passthrough
+ * needs mode 0x10 (the lower cameras, full size, BC4); tracking alone gets mode 4 (all four
+ * cameras, half size, short exposure, the lower and upper pairs in turn) */
 static pthread_mutex_t g_camera_ctl = PTHREAD_MUTEX_INITIALIZER;
-static int g_camera_users;
+static int g_passthrough_users, g_tracking_users;
+static volatile int g_camera_mode = CAMERA_MODE_BC4;
 static psvr2_camera_listener g_camera_listener;
 static void *g_camera_listener_ctx;
+static psvr2_tracking_listener g_tracking_listener;
+static void *g_tracking_listener_ctx;
 static void camera_off(void);
 
 /* Gyro integration corrected toward SLAM poses (see fusion.c) */
@@ -341,7 +349,7 @@ void psvr2_stop(void)
 	/* The camera and gaze threads use g_dev — shut them down before closing the
 	 * device, also powering off the headset cameras and eye tracker */
 	pthread_mutex_lock(&g_camera_ctl);
-	g_camera_users = 0;
+	g_passthrough_users = g_tracking_users = 0;
 	camera_off();
 	pthread_mutex_unlock(&g_camera_ctl);
 	psvr2_gaze_stop();
@@ -435,7 +443,7 @@ int psvr2_get_button(void)
 
 static int camera_power(int on)
 {
-	uint8_t data[8] = {1, 0, 0, 0, (uint8_t)(on ? 0x10 : 0x05), 0, 0, 0};
+	uint8_t data[8] = {1, 0, 0, 0, (uint8_t)(on ? g_camera_mode : 0x05), 0, 0, 0};
 	return send_control(0x0B, 1, data, sizeof(data));
 }
 
@@ -443,6 +451,7 @@ static void *camera_thread_fn(void *arg)
 {
 	(void)arg;
 	const int frame_bytes = CAMERA_HEADER_BYTES + 2 * PSVR2_CAM_PLANE_BYTES;
+	const int tracking_bytes = CAMERA_HEADER_BYTES + 2 * PSVR2_TRACK_PICTURE_BYTES;
 	unsigned char *buf = malloc(frame_bytes + 4096);
 	if (buf == NULL) {
 		return NULL;
@@ -459,7 +468,24 @@ static void *camera_thread_fn(void *arg)
 		if (ret != 0) {
 			break;
 		}
-		if (transferred < frame_bytes || buf[0] != 'V' || buf[1] != 'I') {
+		if (buf[0] != 'V' || buf[1] != 'I') {
+			continue;
+		}
+		if (transferred == tracking_bytes) {
+			/* Header byte 0x10: 4 for the lower pair, 5 for the upper; the two pictures are
+			 * stacked, left camera on top */
+			double arrived = monotonic_s();
+			pthread_mutex_lock(&g_camera_lock);
+			psvr2_tracking_listener fn = g_tracking_listener;
+			void *ctx = g_tracking_listener_ctx;
+			pthread_mutex_unlock(&g_camera_lock);
+			if (fn != NULL && (buf[0x10] == 4 || buf[0x10] == 5)) {
+				const unsigned char *p = buf + CAMERA_HEADER_BYTES;
+				fn(buf, buf[0x10] == 5, p, p + PSVR2_TRACK_PICTURE_BYTES, arrived, ctx);
+			}
+			continue;
+		}
+		if (transferred < frame_bytes) {
 			continue;
 		}
 
@@ -530,27 +556,60 @@ static void camera_off(void)
 	libusb_release_interface(g_dev, CAMERA_INTERFACE);
 }
 
-int psvr2_camera_start(void)
+/* The mode the users want; sent to the headset if it changed while the cameras run */
+static void camera_choose_mode(void)
+{
+	int mode = g_passthrough_users > 0 ? CAMERA_MODE_BC4 : CAMERA_MODE_TRACKING;
+	if (mode != g_camera_mode) {
+		g_camera_mode = mode;
+		if (g_camera_running) {
+			camera_power(1);
+		}
+	}
+}
+
+static int camera_start_for(int *users)
 {
 	if (g_dev == NULL) {
 		return -1;
 	}
 	pthread_mutex_lock(&g_camera_ctl);
+	(*users)++;
+	camera_choose_mode();
 	int ret = camera_on();
-	if (ret == 0) {
-		g_camera_users++;
+	if (ret != 0) {
+		(*users)--;
+		camera_choose_mode();
 	}
 	pthread_mutex_unlock(&g_camera_ctl);
 	return ret;
 }
 
-void psvr2_camera_stop(void)
+static void camera_stop_for(int *users)
 {
 	pthread_mutex_lock(&g_camera_ctl);
-	if (g_camera_users > 0 && --g_camera_users == 0) {
+	if (*users > 0) {
+		(*users)--;
+	}
+	if (g_passthrough_users + g_tracking_users == 0) {
 		camera_off();
+	} else {
+		camera_choose_mode();
 	}
 	pthread_mutex_unlock(&g_camera_ctl);
+}
+
+int psvr2_camera_start(void) { return camera_start_for(&g_passthrough_users); }
+void psvr2_camera_stop(void) { camera_stop_for(&g_passthrough_users); }
+int psvr2_camera_start_tracking(void) { return camera_start_for(&g_tracking_users); }
+void psvr2_camera_stop_tracking(void) { camera_stop_for(&g_tracking_users); }
+
+void psvr2_camera_set_tracking_listener(psvr2_tracking_listener fn, void *ctx)
+{
+	pthread_mutex_lock(&g_camera_lock);
+	g_tracking_listener = fn;
+	g_tracking_listener_ctx = ctx;
+	pthread_mutex_unlock(&g_camera_lock);
 }
 
 void psvr2_camera_set_listener(psvr2_camera_listener fn, void *ctx)

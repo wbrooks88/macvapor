@@ -148,7 +148,7 @@ int main(int argc, char **argv) {
     int frames = argc > 1 ? atoi(argv[1]) : 240;
     g_hard = argc > 2 && !strcmp(argv[2], "hard");
     srand(7);
-    strack_camera cam[2], guess[2];
+    strack_camera cam[STRACK_CAMERAS], guess[STRACK_CAMERAS];
     strack_default_cameras(cam);
     memcpy(guess, cam, sizeof cam);
     if (g_hard && !getenv("NO_CAL")) {
@@ -247,6 +247,7 @@ int main(int argc, char **argv) {
         }
         double t0 = now_s();
         for (int c = 0; c < 2; c++) strack_detect_bc4(t, c, bc4[c], W / 4);
+        for (int c = 2; c < STRACK_CAMERAS; c++) strack_no_picture(t, c);
         strack_result r[2];
         strack_solve(t, &in, r);
         double dt = now_s() - t0;
@@ -293,7 +294,7 @@ int main(int argc, char **argv) {
     }
     {
         float rms;
-        strack_camera got[2];
+        strack_camera got[STRACK_CAMERAS];
         strack_get_cameras(t, got);
         int runs = strack_calibration(t, &rms);
         printf("calibrations: %d, fit %.2f px\n", runs, rms);

@@ -119,7 +119,7 @@ away: red ahead, green right, blue behind, yellow left. Check:
   where it points. Pull a trigger: its ball lights up and the controller buzzes. Hold the
   controllers out in front of you and move them: the balls should follow your hands, not just turn
   about your elbows. If they don't, use Capture controllers in MacVapoR (or
-  `psvr2xr-selftest --capture-controllers`), move the controllers around in front of you for 10
+  `psvr2xr-selftest --capture-controllers`), move the controllers around in front of you for 20
   seconds, and send me the `PS VR2 Controller Capture` folder from your Desktop as a zip, with the log.
 - Both eyes fuse into one 3D picture. If it looks doubled or uncomfortable, close it right away
   and send me the log.

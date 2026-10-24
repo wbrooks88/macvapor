@@ -11,7 +11,7 @@
 #define DEG (PI_F / 180)
 #define RING_LEVEL 0.6f   // of the threshold: what counts as bright around a dot
 
-enum { FRAME_W = 1024, FRAME_H = 1016, STACK_CAP = FRAME_W * 8, MAX_MATCHES = 2 * STRACK_LEDS, MAX_PAIRS = 128, HYPOTHESES = 6 };
+enum { FRAME_W = 1024, FRAME_H = 1016, ALL_CAMS = (1 << STRACK_CAMERAS) - 1, STACK_CAP = FRAME_W * 8, MAX_MATCHES = 2 * STRACK_LEDS, MAX_PAIRS = 128, HYPOTHESES = 6 };
 
 // ------------------------------------------------------------------------------------ LED model
 //
@@ -174,21 +174,24 @@ static bool solve_n(int n, double *A, double *b) {
 // --------------------------------------------------------------------------------------- camera
 
 void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
-    // Fitted to a capture from a real headset (both controllers moving in front of the wearer, 60
-    // frames): the turn, centre and focal length that make the two cameras agree on where each
-    // controller is (to about a centimetre) and put the most LEDs on dots. The lenses are toed in
-    // by roll as well as yaw, and look about 28 degrees down.
+    // The lower pair fitted to a capture from a real headset (both controllers moving in front of
+    // the wearer, 60 frames): the turn, centre and focal length that make the two cameras agree on
+    // where each controller is (to about a centimetre) and put the most LEDs on dots. The lenses
+    // are toed in by roll as well as yaw, and look about 28 degrees down. The upper pair is only a
+    // guess, the lower pair's mirror image, and stays off until fitted.
     static const float k[STRACK_CAMERAS][5] = {
         // cx, cy, yaw, pitch, roll
         {509.6f, 478.0f, 12.8f, -26.0f, -6.8f},
         {500.5f, 508.0f, -11.0f, -30.0f, 6.4f},
+        {508.0f, 508.0f, 15.0f, 28.0f, 6.0f},
+        {508.0f, 508.0f, -15.0f, 28.0f, -6.0f},
     };
     for (int i = 0; i < STRACK_CAMERAS; i++) {
-        float side = i == 0 ? -1 : 1;
+        float side = i % 2 == 0 ? -1 : 1, up = i >= 2 ? 1 : -1;
         out[i] = (strack_camera){
             .f = 410.5f, .cx = k[i][0], .cy = k[i][1], .k = {0.03f, 0, 0, 0}, .max_angle_deg = 78,
-            .width = 1016, .height = 1016, .position = {side * 0.060f, -0.030f, -0.102f},
-            .yaw_deg = k[i][2], .pitch_deg = k[i][3], .roll_deg = k[i][4],
+            .width = 1016, .height = 1016, .position = {side * 0.060f, up * 0.030f, -0.102f},
+            .yaw_deg = k[i][2], .pitch_deg = k[i][3], .roll_deg = k[i][4], .off = i >= 2,
         };
     }
 }
@@ -280,7 +283,9 @@ struct strack {
     strack_camera cam[STRACK_CAMERAS];
     float Rhc[STRACK_CAMERAS][9];       // camera axes to head axes
     strack_params prm;
-    uint8_t *gray, *seen;               // one camera's picture at a time
+    uint8_t *gray, *seen;               // one camera's picture at a time, fw by fh
+    int fw, fh;
+    float fscale;                       // its pixels to the camera model's
     int *stack, *hot;                   // the flood fill's, and the bright blocks
     strack_blob blobs[STRACK_CAMERAS][STRACK_MAX_BLOBS];
     int nblobs[STRACK_CAMERAS];
@@ -351,10 +356,10 @@ static void fill_blob(strack *t, int cam, int x0, int y0) {
     double sw = 0, sx = 0, sy = 0;
     float thr = t->prm.threshold;
     bool overflow = false;
-    stack[sp++] = y0 * FRAME_W + x0;
-    t->seen[y0 * FRAME_W + x0] = 1;
+    stack[sp++] = y0 * t->fw + x0;
+    t->seen[y0 * t->fw + x0] = 1;
     while (sp) {
-        int i = stack[--sp], x = i % FRAME_W, y = i / FRAME_W;
+        int i = stack[--sp], x = i % t->fw, y = i / t->fw;
         float w = t->gray[i] - thr + 1;
         area++;
         sw += w; sx += w * x; sy += w * y;
@@ -365,8 +370,8 @@ static void fill_blob(strack *t, int cam, int x0, int y0) {
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++) {
                 int nx = x + dx, ny = y + dy;
-                if (nx < 0 || ny < 0 || nx >= FRAME_W || ny >= FRAME_H) continue;
-                int j = ny * FRAME_W + nx;
+                if (nx < 0 || ny < 0 || nx >= t->fw || ny >= t->fh) continue;
+                int j = ny * t->fw + nx;
                 if (t->seen[j] || t->gray[j] < thr) continue;
                 t->seen[j] = 1;
                 if (sp < STACK_CAP) stack[sp++] = j;
@@ -386,11 +391,13 @@ static void fill_blob(strack *t, int cam, int x0, int y0) {
     int bright = 0, n = 0;
     for (int k = 0; k < 32; k++) {
         int x = (int)(b.x - 0.5f + r * cosf(k * PI_F / 16)), y = (int)(b.y - 0.5f + r * sinf(k * PI_F / 16));
-        if (x < 0 || y < 0 || x >= FRAME_W || y >= FRAME_H) continue;
+        if (x < 0 || y < 0 || x >= t->fw || y >= t->fh) continue;
         n++;
-        bright += t->gray[y * FRAME_W + x] >= ring && t->gray[y * FRAME_W + x] < thr;
+        bright += t->gray[y * t->fw + x] >= ring && t->gray[y * t->fw + x] < thr;
     }
     if (bright * 6 > n) return;
+    b.x *= t->fscale;
+    b.y *= t->fscale;
     const strack_camera *c = &t->cam[cam];
     if (b.x >= c->width || b.y >= c->height) return;
     strack_unproject(c, b.x, b.y, b.ray);
@@ -398,14 +405,35 @@ static void fill_blob(strack *t, int cam, int x0, int y0) {
     add_blob(t, cam, &b);
 }
 
-int strack_detect_gray(strack *t, int cam, const uint8_t *pixels, int stride) {
+static void detect_start(strack *t, int cam, int w, int h, float scale) {
     t->nblobs[cam] = 0;
-    for (int y = 0; y < FRAME_H; y++) memcpy(t->gray + y * FRAME_W, pixels + (size_t)y * stride, FRAME_W);
-    memset(t->seen, 0, FRAME_W * FRAME_H);
+    t->fw = w;
+    t->fh = h;
+    t->fscale = scale;
+    memset(t->seen, 0, (size_t)w * h);
+}
+
+static void detect_gray(strack *t, int cam, const uint8_t *pixels, int w, int h, int stride, float scale) {
+    detect_start(t, cam, w, h, scale);
+    for (int y = 0; y < h; y++) memcpy(t->gray + y * w, pixels + (size_t)y * stride, w);
     uint8_t thr = (uint8_t)fminf(255, fmaxf(1, t->prm.threshold));
-    for (int i = 0; i < FRAME_W * FRAME_H; i++)
-        if (t->gray[i] >= thr && !t->seen[i]) fill_blob(t, cam, i % FRAME_W, i / FRAME_W);
+    for (int i = 0; i < w * h; i++)
+        if (t->gray[i] >= thr && !t->seen[i]) fill_blob(t, cam, i % w, i / w);
+}
+
+int strack_detect_gray(strack *t, int cam, const uint8_t *pixels, int stride) {
+    detect_gray(t, cam, pixels, FRAME_W, FRAME_H, stride, 1);
     return t->nblobs[cam];
+}
+
+int strack_detect_half(strack *t, int cam, const uint8_t *pixels, int width, int height, int stride) {
+    if (t->cam[cam].off) { t->nblobs[cam] = 0; return 0; }
+    detect_gray(t, cam, pixels, width < FRAME_W ? width : FRAME_W, height < FRAME_H ? height : FRAME_H, stride, 2);
+    return t->nblobs[cam];
+}
+
+void strack_no_picture(strack *t, int cam) {
+    t->nblobs[cam] = 0;
 }
 
 // One BC4 block's 16 values.
@@ -427,9 +455,8 @@ static void bc4_block(const uint8_t *b, uint8_t out[16]) {
 }
 
 int strack_detect_bc4(strack *t, int cam, const uint8_t *bc4, int stride_blocks) {
-    t->nblobs[cam] = 0;
+    detect_start(t, cam, FRAME_W, FRAME_H, 1);
     memset(t->gray, 0, FRAME_W * FRAME_H);
-    memset(t->seen, 0, FRAME_W * FRAME_H);
     int thr = (int)fminf(255, fmaxf(1, t->prm.threshold)), ring = (int)(RING_LEVEL * thr);
     int *hot = t->hot, nhot = 0;
     for (int by = 0; by < FRAME_H / 4; by++)
@@ -499,7 +526,7 @@ static int match_pose(const strack *t, int hand, const hpose *P, float gate, int
     int n = 0;
     *sse = 0;
     for (int c = 0; c < STRACK_CAMERAS; c++) {
-        if (!(cams & 1 << c)) continue;
+        if (!(cams & 1 << c) || t->cam[c].off) continue;
         cand cs[STRACK_LEDS * 4];
         int nc = 0;
         for (int i = 0; i < STRACK_LEDS; i++) {
@@ -644,7 +671,7 @@ static int polish_with(const problem *pr, hpose *P, float wide_gate, int cams, m
 static int polish(const problem *pr, hpose *P, float wide_gate, match *m, float *rms) {
     const strack *t = pr->t;
     hpose start = *P;
-    int n = polish_with(pr, P, wide_gate, 3, m, rms);
+    int n = polish_with(pr, P, wide_gate, ALL_CAMS, m, rms);
     if (n >= 2 && *rms <= t->prm.max_rms_px) return n;
     int best = n;
     for (int c = 0; c < STRACK_CAMERAS; c++) {
@@ -739,7 +766,7 @@ static int search(const problem *base, float range, hpose *found, match *m, floa
                         for (int k = 0; k < 3; k++) P.p[k] += t->cam[c].position[k];
                         match mm2[MAX_MATCHES];
                         float sse;
-                        int n = match_pose(t, base->hand, &P, t->prm.gate_px * 1.6f, 3, mm2, &sse);
+                        int n = match_pose(t, base->hand, &P, t->prm.gate_px * 1.6f, ALL_CAMS, mm2, &sse);
                         if (n >= 3 && reachable(&P)) keep_hypothesis(best, &nbest, &P, n, sse);
                     }
                 }
@@ -1080,7 +1107,7 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     // For calibration, the LEDs as matched in both cameras, even when the pose came from one.
     match all[MAX_MATCHES];
     float sse;
-    int na = match_pose(t, h, P, t->prm.gate_px * 3, 3, all, &sse);
+    int na = match_pose(t, h, P, t->prm.gate_px * 3, ALL_CAMS, all, &sse);
     if (na >= n) keep_sample(t, in, h, &j->pr, P, all, na);
     else keep_sample(t, in, h, &j->pr, P, m, n);
     for (int i = 0; i < n; i++) t->claimed[m[i].cam][m[i].blob] = true;

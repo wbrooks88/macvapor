@@ -58,11 +58,28 @@ const float *psvr2_distortion_lut(void);
 /* BC4: 4 bits per pixel */
 #define PSVR2_CAM_PLANE_BYTES (PSVR2_CAM_WIDTH * PSVR2_CAM_HEIGHT / 2)
 
-/* Powers on the cameras and starts the read thread. 0 — success. Counted: passthrough and
- * controller tracking each start and stop them, and they stay on while either wants them. */
+/* Powers on the cameras and starts the read thread for passthrough. 0 — success. Counted:
+ * passthrough and controller tracking each start and stop them, and they stay on while either
+ * wants them. */
 int psvr2_camera_start(void);
 
 void psvr2_camera_stop(void);
+
+/* The same for controller tracking. While nothing wants passthrough, the headset sends the
+ * tracking mode instead of the BC4 frames: all four cameras at half size (512x508 8-bit, the last few
+ * columns padding), short exposure, the lower pair and then the upper pair,
+ * taken at the same moment, 60 times a second each. */
+#define PSVR2_TRACK_WIDTH 512
+#define PSVR2_TRACK_HEIGHT 508
+#define PSVR2_TRACK_PICTURE_BYTES (PSVR2_TRACK_WIDTH * PSVR2_TRACK_HEIGHT)
+int psvr2_camera_start_tracking(void);
+void psvr2_camera_stop_tracking(void);
+
+/* Called on the camera thread with each tracking-mode packet: its header, which pair (0 lower, 1 upper), and its left and
+ * right pictures. Only valid during the call. NULL stops it. */
+typedef void (*psvr2_tracking_listener)(const unsigned char *header, int upper, const unsigned char *left,
+                                        const unsigned char *right, double arrived_s, void *ctx);
+void psvr2_camera_set_tracking_listener(psvr2_tracking_listener fn, void *ctx);
 
 /* Called on the camera thread with every frame as it arrives: the packet's 256-byte header, the
  * two BC4 planes (left camera, right camera; PSVR2_CAM_PLANE_BYTES each, 256 blocks to a row), and

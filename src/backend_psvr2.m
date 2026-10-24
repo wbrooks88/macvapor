@@ -505,15 +505,22 @@ static axr_motion hand_motion(int hand, int64_t time) {
     return m;
 }
 
-// The camera thread's newest frame, waiting for tracking_thread.
+// The camera thread's newest frame, waiting for tracking_thread: the lower pair as BC4 while
+// passthrough has the cameras in that mode, or else all four half-size pictures.
 static pthread_mutex_t g_track_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_track_cond = PTHREAD_COND_INITIALIZER;
 static unsigned char *g_track_planes[2], g_track_header[256];
+static unsigned char *g_track_half[STRACK_CAMERAS], g_track_half_header[2][256];
+static bool g_track_has[STRACK_CAMERAS];
 static double g_track_arrived;
-static bool g_track_pending;
+static bool g_track_pending, g_track_is_half;
+// The lower pair waits here for the upper pair taken at the same moment.
+static unsigned char *g_lower_wait[2], g_lower_wait_header[256];
+static double g_lower_wait_arrived;
+static bool g_lower_waiting;
 
 // Statistics for the status line, under g_lock.
-static unsigned g_stat_track_frames, g_stat_track_dots[2], g_stat_track_seen[2], g_stat_track_leds[2];
+static unsigned g_stat_track_frames, g_stat_track_dots[STRACK_CAMERAS], g_stat_track_seen[2], g_stat_track_leds[2];
 static float g_stat_track_rms[2];
 
 static void camera_frame(const unsigned char *header, const unsigned char *left, const unsigned char *right,
@@ -524,15 +531,47 @@ static void camera_frame(const unsigned char *header, const unsigned char *left,
     memcpy(g_track_planes[1], right, PSVR2_CAM_PLANE_BYTES);
     memcpy(g_track_header, header, sizeof g_track_header);
     g_track_arrived = arrived_s;
+    g_track_is_half = false;
     g_track_pending = true;
     pthread_cond_signal(&g_track_cond);
     pthread_mutex_unlock(&g_track_lock);
 }
 
-// <config>/controller_cameras.json: where the two lower cameras sit and point and how their lenses
-// bend, in sense_track.h's terms. Written with the guess on first run; the tracker calibrates it as
-// it goes, and the calibrated cameras are saved back so the next run starts from them.
-// Each run starts from the built-in cameras and calibrates a little way from them; what it found is
+// The two pairs come one after the other with the same exposure time in their headers (bytes 8 to
+// 11); both go to the tracker together. An upper pair without its lower one goes alone.
+static void tracking_frame(const unsigned char *header, int upper, const unsigned char *left,
+                           const unsigned char *right, double arrived_s, void *ctx) {
+    (void)ctx;
+    pthread_mutex_lock(&g_track_lock);
+    if (!upper) {
+        memcpy(g_lower_wait[0], left, PSVR2_TRACK_PICTURE_BYTES);
+        memcpy(g_lower_wait[1], right, PSVR2_TRACK_PICTURE_BYTES);
+        memcpy(g_lower_wait_header, header, 256);
+        g_lower_wait_arrived = arrived_s;
+        g_lower_waiting = true;
+    } else {
+        bool pair = g_lower_waiting && !memcmp(g_lower_wait_header + 8, header + 8, 4);
+        if (pair) {
+            memcpy(g_track_half[0], g_lower_wait[0], PSVR2_TRACK_PICTURE_BYTES);
+            memcpy(g_track_half[1], g_lower_wait[1], PSVR2_TRACK_PICTURE_BYTES);
+            memcpy(g_track_half_header[0], g_lower_wait_header, 256);
+        }
+        memcpy(g_track_half[2], left, PSVR2_TRACK_PICTURE_BYTES);
+        memcpy(g_track_half[3], right, PSVR2_TRACK_PICTURE_BYTES);
+        memcpy(g_track_half_header[1], header, 256);
+        g_track_has[0] = g_track_has[1] = pair;
+        g_track_has[2] = g_track_has[3] = true;
+        g_track_arrived = pair ? g_lower_wait_arrived : arrived_s;
+        g_lower_waiting = false;
+        g_track_is_half = true;
+        g_track_pending = true;
+        pthread_cond_signal(&g_track_cond);
+    }
+    pthread_mutex_unlock(&g_track_lock);
+}
+
+// <config>/controller_cameras.json: where the cameras sit and point and how their lenses bend, in
+// sense_track.h's terms. Each run starts from the built-in cameras and calibrates a little way from them; what it found is
 // saved to look at. Starting from the last run's calibration let it wander further every run. A
 // file whose cameras say "pinned": true is used instead, and left alone.
 static bool g_cameras_pinned;
@@ -545,13 +584,13 @@ static void save_cameras(const strack_camera cams[STRACK_CAMERAS], int calibrati
     for (int c = 0; c < STRACK_CAMERAS; c++) {
         const strack_camera *k = &cams[c];
         [list addObject:@{
-            @"camera" : c == 0 ? @"lower left" : @"lower right",
+            @"camera" : @[ @"lower left", @"lower right", @"upper left", @"upper right" ][c],
             @"f" : @(k->f), @"cx" : @(k->cx), @"cy" : @(k->cy),
             @"k" : @[ @(k->k[0]), @(k->k[1]), @(k->k[2]), @(k->k[3]) ],
             @"max_angle_deg" : @(k->max_angle_deg), @"width" : @(k->width), @"height" : @(k->height),
             @"position" : @[ @(k->position[0]), @(k->position[1]), @(k->position[2]) ],
             @"yaw_deg" : @(k->yaw_deg), @"pitch_deg" : @(k->pitch_deg), @"roll_deg" : @(k->roll_deg),
-            @"calibrations" : @(calibrations), @"pinned" : @NO,
+            @"calibrations" : @(calibrations), @"pinned" : @NO, @"off" : @(k->off),
         }];
     }
     [[NSJSONSerialization dataWithJSONObject:list options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
@@ -581,27 +620,39 @@ static void load_cameras(strack_camera cams[STRACK_CAMERAS]) {
         if (d[@"yaw_deg"]) k->yaw_deg = [d[@"yaw_deg"] floatValue];
         if (d[@"pitch_deg"]) k->pitch_deg = [d[@"pitch_deg"] floatValue];
         if (d[@"roll_deg"]) k->roll_deg = [d[@"roll_deg"] floatValue];
+        if (d[@"off"]) k->off = [d[@"off"] boolValue];
     }
 }
 
-// --capture-controllers (PSVR2XR_CAPTURE_DIR): every 4th camera frame, up to 150 (10 s), as it came
-// (frame_NNN.bin: the 256-byte header, then the left and right BC4 planes), with a line per frame
-// in frames.jsonl of what the tracker was given and found, to work out from them what's wrong.
+// --capture-controllers (PSVR2XR_CAPTURE_DIR): every 4th camera frame, up to 300 (20 s), as it came
+// (frame_NNN.bin: the 256-byte header, then the left and right BC4 planes; or frame_NNN.m4 in the
+// tracking mode: the lower pair's header and two pictures, then the upper pair's, zeros for a pair
+// that didn't come), with a line per frame in frames.jsonl of what the tracker was given and found,
+// to work out from them what's wrong.
 static FILE *g_capture;
 static NSString *g_capture_dir;
 static unsigned g_capture_frames, g_capture_saved;
 
-static void capture_frame(const unsigned char *header, unsigned char *const planes[2], const strack_input *in,
-                          const strack_result r[2]) {
-    if (!g_capture || g_capture_saved >= 150 || g_capture_frames++ % 4) return;
-    NSString *name = [NSString stringWithFormat:@"frame_%03u.bin", g_capture_saved++];
+static void capture_frame(bool half, const unsigned char *header, unsigned char *const planes[2],
+                          unsigned char headers[2][256], unsigned char *const pictures[STRACK_CAMERAS],
+                          const bool has[STRACK_CAMERAS], const strack_input *in, const strack_result r[2]) {
+    if (!g_capture || g_capture_saved >= 300 || g_capture_frames++ % 4) return;
+    NSString *name = [NSString stringWithFormat:half ? @"frame_%03u.m4" : @"frame_%03u.bin", g_capture_saved++];
     FILE *f = fopen([g_capture_dir stringByAppendingPathComponent:name].fileSystemRepresentation, "wb");
-    if (f) {
+    if (f && !half) {
         fwrite(header, 1, 256, f);
         fwrite(planes[0], 1, PSVR2_CAM_PLANE_BYTES, f);
         fwrite(planes[1], 1, PSVR2_CAM_PLANE_BYTES, f);
-        fclose(f);
+    } else if (f) {
+        static unsigned char zeros[PSVR2_TRACK_PICTURE_BYTES];
+        for (int pair = 0; pair < 2; pair++) {
+            bool ok = has[2 * pair];
+            fwrite(ok ? headers[pair] : zeros, 1, 256, f);
+            fwrite(ok ? pictures[2 * pair] : zeros, 1, PSVR2_TRACK_PICTURE_BYTES, f);
+            fwrite(ok ? pictures[2 * pair + 1] : zeros, 1, PSVR2_TRACK_PICTURE_BYTES, f);
+        }
     }
+    if (f) fclose(f);
     fprintf(g_capture, "{\"file\": \"%s\", \"time_ns\": %lld, \"head\": {\"q\": [%.6f, %.6f, %.6f, %.6f], \"p\": [%.4f, %.4f, %.4f]}",
             name.UTF8String, (long long)in->time_ns, in->head.q[0], in->head.q[1], in->head.q[2], in->head.q[3],
             in->head.p[0], in->head.p[1], in->head.p[2]);
@@ -619,19 +670,24 @@ static void capture_frame(const unsigned char *header, unsigned char *const plan
     for (int c = 0; c < STRACK_CAMERAS; c++) {
         int n;
         const strack_blob *b = strack_blobs(g_tracker, c, &n);
-        fprintf(g_capture, ", \"dots_%s\": [", c ? "right" : "left");
+        static const char *names[] = {"left", "right", "upper_left", "upper_right"};
+        fprintf(g_capture, ", \"dots_%s\": [", names[c]);
         for (int i = 0; i < n; i++)
             fprintf(g_capture, "%s[%.2f, %.2f, %d, %.0f]", i ? ", " : "", b[i].x, b[i].y, b[i].area, b[i].brightness);
         fprintf(g_capture, "]");
     }
     fprintf(g_capture, "}\n");
     fflush(g_capture);
-    if (g_capture_saved == 150) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
+    if (g_capture_saved == 300) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
 }
 
 static void *tracking_thread(void *arg) {
     (void)arg;
     unsigned char *planes[2] = {malloc(PSVR2_CAM_PLANE_BYTES), malloc(PSVR2_CAM_PLANE_BYTES)}, header[256];
+    unsigned char *pictures[STRACK_CAMERAS], headers[2][256];
+    bool has[STRACK_CAMERAS];
+    for (int c = 0; c < STRACK_CAMERAS; c++)
+        if (!(pictures[c] = malloc(PSVR2_TRACK_PICTURE_BYTES))) return NULL;
     if (!planes[0] || !planes[1]) return NULL;
     int saved_calibrations = 0;
     int64_t last_save = 0;
@@ -639,9 +695,18 @@ static void *tracking_thread(void *arg) {
         pthread_mutex_lock(&g_track_lock);
         while (!g_track_pending) pthread_cond_wait(&g_track_cond, &g_track_lock);
         g_track_pending = false;
-        memcpy(planes[0], g_track_planes[0], PSVR2_CAM_PLANE_BYTES);
-        memcpy(planes[1], g_track_planes[1], PSVR2_CAM_PLANE_BYTES);
-        memcpy(header, g_track_header, sizeof header);
+        bool half = g_track_is_half;
+        if (half) {
+            for (int c = 0; c < STRACK_CAMERAS; c++) {
+                has[c] = g_track_has[c];
+                if (has[c]) memcpy(pictures[c], g_track_half[c], PSVR2_TRACK_PICTURE_BYTES);
+            }
+            memcpy(headers, g_track_half_header, sizeof headers);
+        } else {
+            memcpy(planes[0], g_track_planes[0], PSVR2_CAM_PLANE_BYTES);
+            memcpy(planes[1], g_track_planes[1], PSVR2_CAM_PLANE_BYTES);
+            memcpy(header, g_track_header, sizeof header);
+        }
         int64_t exposed = (int64_t)(g_track_arrived * 1e9) - (int64_t)(g_cfg.controller_latency_ms * 1e6f);
         pthread_mutex_unlock(&g_track_lock);
 
@@ -649,8 +714,16 @@ static void *tracking_thread(void *arg) {
             g_tracker_reset = false;
             strack_forget(g_tracker);
         }
-        int dots[2];
-        for (int c = 0; c < STRACK_CAMERAS; c++) dots[c] = strack_detect_bc4(g_tracker, c, planes[c], PSVR2_CAM_WIDTH / 4);
+        int dots[STRACK_CAMERAS] = {0};
+        for (int c = 0; c < STRACK_CAMERAS; c++) {
+            if (half && has[c])   // the last 4 columns are padding
+                dots[c] = strack_detect_half(g_tracker, c, pictures[c], PSVR2_TRACK_WIDTH - 4, PSVR2_TRACK_HEIGHT,
+                                             PSVR2_TRACK_WIDTH);
+            else if (!half && c < 2)
+                dots[c] = strack_detect_bc4(g_tracker, c, planes[c], PSVR2_CAM_WIDTH / 4);
+            else
+                strack_no_picture(g_tracker, c);
+        }
 
         // The head then, and each controller's orientation from its IMU.
         strack_input in = {.time_ns = exposed};
@@ -696,7 +769,7 @@ static void *tracking_thread(void *arg) {
         }
         pthread_mutex_unlock(&g_lock);
 
-        capture_frame(header, planes, &in, r);
+        capture_frame(half, header, planes, headers, pictures, has, &in, r);
         float rms;
         int calibrations = strack_calibration(g_tracker, &rms);
         if (calibrations > saved_calibrations && axr_now_ns() - last_save > 20000000000LL) {
@@ -728,7 +801,10 @@ static void start_controller_tracking(void) {
     g_tracker = strack_create(cams, &prm);
     g_track_planes[0] = malloc(PSVR2_CAM_PLANE_BYTES);
     g_track_planes[1] = malloc(PSVR2_CAM_PLANE_BYTES);
-    if (!g_tracker || !g_track_planes[0] || !g_track_planes[1]) { axr_log("controller tracking: out of memory"); return; }
+    bool ok = g_tracker && g_track_planes[0] && g_track_planes[1];
+    for (int c = 0; c < STRACK_CAMERAS; c++) ok = ok && (g_track_half[c] = malloc(PSVR2_TRACK_PICTURE_BYTES));
+    for (int i = 0; i < 2; i++) ok = ok && (g_lower_wait[i] = malloc(PSVR2_TRACK_PICTURE_BYTES));
+    if (!ok) { axr_log("controller tracking: out of memory"); return; }
     const char *capture = getenv("PSVR2XR_CAPTURE_DIR");
     if (capture) {
         g_capture_dir = @(capture);
@@ -741,17 +817,20 @@ static void start_controller_tracking(void) {
         axr_log("controller capture: saving camera frames to %s", capture);
     }
     psvr2_camera_set_listener(camera_frame, NULL);
-    if (psvr2_camera_start() != 0) {
+    psvr2_camera_set_tracking_listener(tracking_frame, NULL);
+    if (psvr2_camera_start_tracking() != 0) {
         axr_log("controller tracking: the headset's cameras did not start; using the arm model");
         psvr2_camera_set_listener(NULL, NULL);
+        psvr2_camera_set_tracking_listener(NULL, NULL);
         return;
     }
     sense_tracking_leds(true);
     pthread_t t;
     pthread_create(&t, NULL, tracking_thread, NULL);
     pthread_detach(t);
-    axr_log("controller tracking on: lower cameras f %.0f, turned %.0f/%.0f deg out and %.0f down (%s)", cams[0].f,
-            cams[0].yaw_deg, -cams[1].yaw_deg, -cams[0].pitch_deg, cameras_path().UTF8String);
+    axr_log("controller tracking on: lower cameras f %.0f, turned %.0f/%.0f deg out and %.0f down; upper cameras %s (%s)",
+            cams[0].f, cams[0].yaw_deg, -cams[1].yaw_deg, -cams[0].pitch_deg, cams[2].off ? "off" : "on",
+            cameras_path().UTF8String);
 }
 
 // ------------------------------------------------------------------------------------------ eyes
@@ -1549,10 +1628,11 @@ static void *status_thread(void *arg) {
             }
             if (g_tracker) {
                 pthread_mutex_lock(&g_lock);
-                unsigned frames = g_stat_track_frames, dots[2] = {g_stat_track_dots[0], g_stat_track_dots[1]},
+                unsigned frames = g_stat_track_frames, dots[STRACK_CAMERAS],
                          seen[2] = {g_stat_track_seen[0], g_stat_track_seen[1]},
                          leds[2] = {g_stat_track_leds[0], g_stat_track_leds[1]};
                 float rms[2] = {g_stat_track_rms[0], g_stat_track_rms[1]};
+                memcpy(dots, g_stat_track_dots, sizeof dots);
                 g_stat_track_frames = 0;
                 memset(g_stat_track_dots, 0, sizeof g_stat_track_dots);
                 memset(g_stat_track_seen, 0, sizeof g_stat_track_seen);
@@ -1570,10 +1650,11 @@ static void *status_thread(void *arg) {
                         snprintf(side[h], sizeof side[h], "not seen%s",
                                  sense_leds_on(h) ? "" : " (its LEDs are off: is it connected?)");
                 }
-                axr_log("controller tracking: %.0f camera frames/s, %.1f/%.1f dots a frame (left/right camera);"
-                        " left %s; right %s; cameras calibrated %d times%s",
-                        frames / dt, frames ? (double)dots[0] / frames : 0, frames ? (double)dots[1] / frames : 0, side[0],
-                        side[1], cal, cal ? [NSString stringWithFormat:@" (fit %.2f px)", cal_rms].UTF8String : "");
+                double fr = frames ? frames : 1;
+                axr_log("controller tracking: %.0f camera frames/s, %.1f/%.1f/%.1f/%.1f dots a frame (lower left/right,"
+                        " upper left/right camera); left %s; right %s; cameras calibrated %d times%s",
+                        frames / dt, dots[0] / fr, dots[1] / fr, dots[2] / fr, dots[3] / fr, side[0], side[1], cal,
+                        cal ? [NSString stringWithFormat:@" (fit %.2f px)", cal_rms].UTF8String : "");
             }
             if (g_eyes_on) {
                 psvr2_gaze g;
