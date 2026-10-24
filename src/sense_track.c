@@ -9,6 +9,7 @@
 
 #define PI_F 3.14159265f
 #define DEG (PI_F / 180)
+#define RING_LEVEL 0.6f   // of the threshold: what counts as bright around a dot
 
 enum { FRAME_W = 1024, FRAME_H = 1016, STACK_CAP = FRAME_W * 8, MAX_MATCHES = 2 * STRACK_LEDS, MAX_PAIRS = 128, HYPOTHESES = 6 };
 
@@ -365,6 +366,19 @@ static void fill_blob(strack *t, int cam, int x0, int y0) {
     if (bw > 3 * bh + 2 || bh > 3 * bw + 2) return;              // streaks and edges, not dots
     if (area > 12 && area < 0.35f * bw * bh) return;              // rings and odd shapes
     strack_blob b = {.x = (float)(sx / sw) + 0.5f, .y = (float)(sy / sw) + 0.5f, .brightness = (float)sw, .area = area};
+    // An LED is a dot on the dark: around it the picture is dim, or another LED. Bits of a lit
+    // screen, a lamp or a window are surrounded by grey that is nearly as bright (in the headset's
+    // pictures an LED's surroundings top out near 120 with the threshold at 170; a laptop screen's
+    // are all 130 to 170).
+    float r = 2 * sqrtf(area / PI_F) + 2, ring = RING_LEVEL * thr;
+    int bright = 0, n = 0;
+    for (int k = 0; k < 32; k++) {
+        int x = (int)(b.x - 0.5f + r * cosf(k * PI_F / 16)), y = (int)(b.y - 0.5f + r * sinf(k * PI_F / 16));
+        if (x < 0 || y < 0 || x >= FRAME_W || y >= FRAME_H) continue;
+        n++;
+        bright += t->gray[y * FRAME_W + x] >= ring && t->gray[y * FRAME_W + x] < thr;
+    }
+    if (bright * 6 > n) return;
     const strack_camera *c = &t->cam[cam];
     if (b.x >= c->width || b.y >= c->height) return;
     strack_unproject(c, b.x, b.y, b.ray);
@@ -404,13 +418,14 @@ int strack_detect_bc4(strack *t, int cam, const uint8_t *bc4, int stride_blocks)
     t->nblobs[cam] = 0;
     memset(t->gray, 0, FRAME_W * FRAME_H);
     memset(t->seen, 0, FRAME_W * FRAME_H);
-    int thr = (int)fminf(255, fmaxf(1, t->prm.threshold));
+    int thr = (int)fminf(255, fmaxf(1, t->prm.threshold)), ring = (int)(RING_LEVEL * thr);
     int *hot = t->hot, nhot = 0;
     for (int by = 0; by < FRAME_H / 4; by++)
         for (int bx = 0; bx < FRAME_W / 4 && bx < stride_blocks; bx++) {
             const uint8_t *b = bc4 + ((size_t)by * stride_blocks + bx) * 8;
-            // A block's brightest value is one of its end points, or 255 in the six-value mode.
-            if (b[0] < thr && b[1] < thr && b[0] > b[1]) continue;
+            // A block's brightest value is one of its end points, or 255 in the six-value mode. Blocks
+            // nearly as bright are decoded too, for fill_blob() to see what's around a dot.
+            if (b[0] < ring && b[1] < ring && b[0] > b[1]) continue;
             uint8_t px[16];
             bc4_block(b, px);
             bool any = false;
@@ -1018,7 +1033,7 @@ static void claim_around(strack *t, const hpose *P) {
         mtv(t->Rhc[c], w, pc);
         float d = norm3(pc);
         if (d < 0.05f) continue;
-        float reach = cosf(atanf(0.10f / d));
+        float reach = cosf(atanf(0.12f / d));
         for (int b = 0; b < t->nblobs[c]; b++)
             if (dot3(t->blobs[c][b].ray, pc) / d > reach) t->claimed[c][b] = true;
     }
@@ -1068,6 +1083,12 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     o->yaw_error = e[1];
     o->leds = n;
     o->rms_px = rms;
+}
+
+static bool search_hand(strack *t, hand_job *j, hpose *P, match *m, int *n, float *rms) {
+    *rms = 1e9f;
+    *n = search(&j->pr, j->locked, P, m, rms);
+    return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= t->prm.max_rms_px;
 }
 
 void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
@@ -1123,29 +1144,53 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
     }
 
     // The rest are searched for among the dots left, a few times a second. One not seen for a
-    // moment is kept for a quarter of a second, to be looked for near where it was.
+    // moment is kept for a quarter of a second, to be looked for near where it was. Each hand is
+    // searched for on the same dots first: the left controller's LEDs are the right one's mirror
+    // image, so a hand that can't be seen often fits the other's dots fairly well. Where both fit
+    // the same dots, the better fit has them, and the other hand looks again among what's left.
+    bool due[2] = {false, false};
     for (int h = 0; h < 2; h++) {
         hand_state *hs = &t->hs[h];
-        hand_job *j = &jobs[h];
         if (!in->prior_valid[h] || out[h].valid) continue;
-        bool due = !hs->searched || in->time_ns - hs->last_search_ns >= (int64_t)(1e9f / fmaxf(0.5f, t->prm.search_hz));
-        if (!due) continue;
+        due[h] = !hs->searched || in->time_ns - hs->last_search_ns >= (int64_t)(1e9f / fmaxf(0.5f, t->prm.search_hz));
+        if (!due[h]) continue;
         hs->searched = true;
         hs->last_search_ns = in->time_ns;
-        hpose P;
-        match m[MAX_MATCHES];
-        float rms = 1e9f;
-        int n = search(&j->pr, j->locked, &P, m, &rms);
-        if (n < (j->locked ? 4 : t->prm.min_leds) || rms > t->prm.max_rms_px) continue;
+    }
+    hpose sp[2];
+    match sm[2][MAX_MATCHES];
+    int sn[2] = {0, 0};
+    float srms[2] = {1e9f, 1e9f};
+    for (int h = 0; h < 2; h++)
+        if (due[h] && !search_hand(t, &jobs[h], &sp[h], sm[h], &sn[h], &srms[h])) sn[h] = 0;
+    int first = sn[1] > sn[0] || (sn[1] == sn[0] && srms[1] < srms[0]);
+    for (int k = 0; k < 2; k++) {
+        int h = k ? !first : first;
+        if (!sn[h]) continue;
+        if (k && sn[!h]) {
+            // The better one was taken; if it was on these dots, look again without them.
+            float d[3];
+            for (int q = 0; q < 3; q++) d[q] = sp[h].p[q] - sp[!h].p[q];
+            if (norm3(d) < 0.15f && !search_hand(t, &jobs[h], &sp[h], sm[h], &sn[h], &srms[h])) continue;
+        }
+        // Dots the other hand fits at least as well are its, out of sight of its own search.
+        if (!out[!h].valid && in->prior_valid[!h]) {
+            hpose Q = sp[h];
+            match mq[MAX_MATCHES];
+            float rq;
+            mtm(Rh, jobs[!h].Rc, Q.R);   // the other one, turned as its IMU says, here
+            int nq = polish(&jobs[!h].pr, &Q, t->prm.gate_px * 3, mq, &rq);
+            if (nq >= sn[h] && rq <= t->prm.max_rms_px * 1.5f) continue;
+        }
         // Not where the other one is.
         if (out[!h].valid) {
             float R[9], p[3], d[3];
-            world_from_head(in, &P, R, p);
-            for (int k = 0; k < 3; k++) d[k] = p[k] - out[!h].pose.p[k];
+            world_from_head(in, &sp[h], R, p);
+            for (int q = 0; q < 3; q++) d[q] = p[q] - out[!h].pose.p[q];
             if (norm3(d) < 0.08f) continue;
         }
-        j->following = false;
-        accept(t, in, h, j, &P, m, n, rms, true, &out[h]);
+        jobs[h].following = false;
+        accept(t, in, h, &jobs[h], &sp[h], sm[h], sn[h], srms[h], true, &out[h]);
     }
 
     if (t->ncal >= 15 && t->cal_new >= 8 && in->time_ns - t->last_cal_ns > 2000000000LL) {

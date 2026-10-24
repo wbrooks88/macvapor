@@ -580,7 +580,7 @@ static void load_cameras(strack_camera cams[STRACK_CAMERAS]) {
     }
 }
 
-// --capture-controllers (PSVR2XR_CAPTURE_DIR): every 15th camera frame, up to 60, as it came
+// --capture-controllers (PSVR2XR_CAPTURE_DIR): every 4th camera frame, up to 150 (10 s), as it came
 // (frame_NNN.bin: the 256-byte header, then the left and right BC4 planes), with a line per frame
 // in frames.jsonl of what the tracker was given and found, to work out from them what's wrong.
 static FILE *g_capture;
@@ -589,7 +589,7 @@ static unsigned g_capture_frames, g_capture_saved;
 
 static void capture_frame(const unsigned char *header, unsigned char *const planes[2], const strack_input *in,
                           const strack_result r[2]) {
-    if (!g_capture || g_capture_saved >= 60 || g_capture_frames++ % 15) return;
+    if (!g_capture || g_capture_saved >= 150 || g_capture_frames++ % 4) return;
     NSString *name = [NSString stringWithFormat:@"frame_%03u.bin", g_capture_saved++];
     FILE *f = fopen([g_capture_dir stringByAppendingPathComponent:name].fileSystemRepresentation, "wb");
     if (f) {
@@ -622,7 +622,7 @@ static void capture_frame(const unsigned char *header, unsigned char *const plan
     }
     fprintf(g_capture, "}\n");
     fflush(g_capture);
-    if (g_capture_saved == 60) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
+    if (g_capture_saved == 150) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
 }
 
 static void *tracking_thread(void *arg) {
