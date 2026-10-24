@@ -77,12 +77,14 @@ typedef struct {
 static sample S[MAXS];
 static int NS;
 
+static int g_cam;   // which camera score() is for
+
 static int score(const strack_camera *c, float gate) {
     float R[9];
     camrot(c, R);
     int total = 0;
     for (int s = 0; s < NS; s++) {
-        if (S[s].cam != (c->position[1] > 0 ? (c->position[0] < 0 ? 2 : 3) : -1)) continue;
+        if (S[s].cam != g_cam) continue;
         unsigned long long used = 0;
         for (int i = 0; i < STRACK_LEDS; i++) {
             float w[3], pc[3], nc[3], u, v;
@@ -106,7 +108,7 @@ static int score(const strack_camera *c, float gate) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s <capture dir>\n", argv[0]); return 1; }
+    if (argc < 2) { fprintf(stderr, "usage: %s <capture dir> ...\n", argv[0]); return 1; }
     strack_camera cams[STRACK_CAMERAS], on[STRACK_CAMERAS];
     strack_default_cameras(cams);
     memcpy(on, cams, sizeof on);
@@ -114,18 +116,19 @@ int main(int argc, char **argv) {
     strack_params prm;
     strack_default_params(&prm);
     prm.calibrate = false;
-    strack *t = strack_create(cams, &prm), *det = strack_create(on, &prm);
     char path[1024];
     static char line[1 << 17];
-    snprintf(path, sizeof path, "%s/frames.jsonl", argv[1]);
-    FILE *fl = fopen(path, "r");
-    if (!fl) return 1;
     unsigned char *buf = malloc(2 * (256 + 2 * TP));
+    for (int arg = 1; arg < argc; arg++) {
+    strack *t = strack_create(cams, &prm), *det = strack_create(on, &prm);
+    snprintf(path, sizeof path, "%s/frames.jsonl", argv[arg]);
+    FILE *fl = fopen(path, "r");
+    if (!fl) continue;
     while (fgets(line, sizeof line, fl) && NS < MAXS - 2) {
         char name[64];
         const char *fp = strstr(line, "\"file\": \"");
         if (!fp || sscanf(fp + 9, "%63[^\"]", name) != 1 || !strstr(name, ".m4")) continue;
-        snprintf(path, sizeof path, "%s/%s", argv[1], name);
+        snprintf(path, sizeof path, "%s/%s", argv[arg], name);
         FILE *fb = fopen(path, "rb");
         if (!fb) continue;
         size_t got = fread(buf, 1, 2 * (256 + 2 * TP), fb);
@@ -181,8 +184,13 @@ int main(int argc, char **argv) {
             }
         }
     }
+    fclose(fl);
+    strack_destroy(t);
+    strack_destroy(det);
+    }
     printf("%d samples (controller well seen below, three or more dots above)\n", NS);
     for (int c = 2; c < STRACK_CAMERAS; c++) {
+        g_cam = c;
         strack_camera best = on[c], k = on[c];
         int bs = -1;
         for (float yaw = -90; yaw <= 90; yaw += 6)
@@ -194,23 +202,25 @@ int main(int argc, char **argv) {
                 }
         printf("camera %d coarse: yaw %.0f pitch %.0f roll %.0f, %d LEDs\n", c, best.yaw_deg, best.pitch_deg, best.roll_deg, bs);
         // Finer, with the centre and focal length.
-        float step[6] = {2, 2, 2, 10, 10, 10};
+        float step[10] = {2, 2, 2, 10, 10, 10, 0.02f, 0.01f, 0.01f, 0.01f};
         for (int round = 0; round < 6; round++) {
-            for (int p = 0; p < 6; p++)
+            for (int p = 0; p < 10; p++)
                 for (int sg = -1; sg <= 1; sg += 2)
                     for (;;) {
                         k = best;
-                        float *f[6] = {&k.yaw_deg, &k.pitch_deg, &k.roll_deg, &k.cx, &k.cy, &k.f};
+                        float *f[10] = {&k.yaw_deg, &k.pitch_deg, &k.roll_deg, &k.cx, &k.cy, &k.f, &k.k[0],
+                                        &k.position[0], &k.position[1], &k.position[2]};
                         *f[p] += sg * step[p];
                         int sc = score(&k, 6);
                         int cur = score(&best, 6);
                         if (sc > cur) best = k;
                         else break;
                     }
-            for (int p = 0; p < 6; p++) step[p] /= 2;
+            for (int p = 0; p < 10; p++) step[p] /= 2;
         }
-        printf("camera %d: f %.1f cx %.1f cy %.1f yaw %.1f pitch %.1f roll %.1f, %d LEDs within 6 px (%d within 14)\n", c,
-               best.f, best.cx, best.cy, best.yaw_deg, best.pitch_deg, best.roll_deg, score(&best, 6), score(&best, 14));
+        printf("camera %d: f %.1f cx %.1f cy %.1f yaw %.1f pitch %.1f roll %.1f k1 %.3f at (%.3f %.3f %.3f), %d LEDs within"
+               " 6 px (%d within 14)\n", c, best.f, best.cx, best.cy, best.yaw_deg, best.pitch_deg, best.roll_deg, best.k[0],
+               best.position[0], best.position[1], best.position[2], score(&best, 6), score(&best, 14));
     }
     return 0;
 }

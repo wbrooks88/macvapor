@@ -1178,7 +1178,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         j->locked = !poor && in->time_ns < hs->locked_until_ns;
         float age = (in->time_ns - hs->confirmed_ns) / 1e9f;
         j->range = j->locked ? 8 * DEG : hs->confirmed_ns && age < 60 ? (25 + 1.5f * age) * DEG : PI_F;
-        j->pr = (problem){.t = t, .hand = h, .w_tilt = 30, .w_yaw = j->locked ? 12.0f : 2.0f};
+        j->pr = (problem){.t = t, .hand = h, .w_tilt = 6, .w_yaw = j->locked ? 12.0f : 2.0f};
         float Ryaw[9];
         quat_to_mat(in->prior_q[h], j->Rw);
         if (!j->locked) hs->yaw_error = 0;
