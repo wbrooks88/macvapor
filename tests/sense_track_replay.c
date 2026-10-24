@@ -3,10 +3,10 @@
 // pictures with the dots found (yellow) and the fitted LEDs (cyan left, magenta right).
 //
 //   cc -O2 -I src tests/sense_track_replay.c src/sense_track.c -lm -o build/sense_track_replay
-//   build/sense_track_replay ~/Desktop/"PS VR2 Controller Capture" /tmp/replay [default]
+//   build/sense_track_replay ~/Desktop/"PS VR2 Controller Capture" /tmp/replay [capture]
 //
-// The cameras start from the capture's controller_cameras.json, or the built-in guess with
-// "default"; CAMS="f cx cy yaw pitch roll" x2 overrides them, THR the dot threshold.
+// The cameras start from the built-in ones, or the capture's controller_cameras.json with
+// "capture"; CAMS="f cx cy yaw pitch roll" x2 overrides them, THR the dot threshold.
 #include "sense_track.h"
 #include <math.h>
 #include <stdio.h>
@@ -58,11 +58,11 @@ static int jarr(const char *s, const char *key, float *out, int n) {
     return 1;
 }
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s <capture dir> <out dir> [default]\n", argv[0]); return 1; }
+    if (argc < 3) { fprintf(stderr, "usage: %s <capture dir> <out dir> [capture]\n", argv[0]); return 1; }
     char path[1024], line[1<<16];
     setvbuf(stdout, NULL, _IONBF, 0);
     strack_camera cams[2]; strack_default_cameras(cams);
-    if (!(argc>3 && !strcmp(argv[3],"default"))) {
+    if (argc>3 && !strcmp(argv[3],"capture")) {
         snprintf(path,sizeof path,"%s/controller_cameras.json",argv[1]);
         FILE *f=fopen(path,"r"); static char js[8192]; size_t n=fread(js,1,sizeof js-1,f); js[n]=0; fclose(f);
         char *objs[2]={js, js};

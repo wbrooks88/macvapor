@@ -532,9 +532,15 @@ static void camera_frame(const unsigned char *header, const unsigned char *left,
 // <config>/controller_cameras.json: where the two lower cameras sit and point and how their lenses
 // bend, in sense_track.h's terms. Written with the guess on first run; the tracker calibrates it as
 // it goes, and the calibrated cameras are saved back so the next run starts from them.
+// Each run starts from the built-in cameras and calibrates a little way from them; what it found is
+// saved to look at. Starting from the last run's calibration let it wander further every run. A
+// file whose cameras say "pinned": true is used instead, and left alone.
+static bool g_cameras_pinned;
+
 static NSString *cameras_path(void) { return [g_config_dir stringByAppendingPathComponent:@"controller_cameras.json"]; }
 
 static void save_cameras(const strack_camera cams[STRACK_CAMERAS], int calibrations) {
+    if (g_cameras_pinned) return;
     NSMutableArray *list = [NSMutableArray array];
     for (int c = 0; c < STRACK_CAMERAS; c++) {
         const strack_camera *k = &cams[c];
@@ -545,7 +551,7 @@ static void save_cameras(const strack_camera cams[STRACK_CAMERAS], int calibrati
             @"max_angle_deg" : @(k->max_angle_deg), @"width" : @(k->width), @"height" : @(k->height),
             @"position" : @[ @(k->position[0]), @(k->position[1]), @(k->position[2]) ],
             @"yaw_deg" : @(k->yaw_deg), @"pitch_deg" : @(k->pitch_deg), @"roll_deg" : @(k->roll_deg),
-            @"calibrations" : @(calibrations),
+            @"calibrations" : @(calibrations), @"pinned" : @NO,
         }];
     }
     [[NSJSONSerialization dataWithJSONObject:list options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
@@ -556,13 +562,11 @@ static void load_cameras(strack_camera cams[STRACK_CAMERAS]) {
     strack_default_cameras(cams);
     NSData *data = [NSData dataWithContentsOfFile:cameras_path()];
     NSArray *list = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-    if (![list isKindOfClass:NSArray.class] || list.count != STRACK_CAMERAS) {
-        save_cameras(cams, 0);
-        return;
-    }
+    if (![list isKindOfClass:NSArray.class] || list.count != STRACK_CAMERAS) return;
     for (int c = 0; c < STRACK_CAMERAS; c++) {
         NSDictionary *d = list[c];
-        if (![d isKindOfClass:NSDictionary.class]) continue;
+        if (![d isKindOfClass:NSDictionary.class] || ![d[@"pinned"] boolValue]) continue;
+        g_cameras_pinned = true;
         strack_camera *k = &cams[c];
         if (d[@"f"]) k->f = fmaxf(100, fminf(1000, [d[@"f"] floatValue]));
         if (d[@"cx"]) k->cx = [d[@"cx"] floatValue];

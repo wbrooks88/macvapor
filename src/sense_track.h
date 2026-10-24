@@ -37,9 +37,8 @@ typedef struct {
     float roll_deg;         // + turns the picture counterclockwise
 } strack_camera;
 
-// The guess used until there's a better one: the lower cameras at the front corners of the
-// visor, turned 20 degrees out and 35 down, seeing about 150 degrees across (the same lens that
-// passthrough assumes).
+// The cameras as fitted to a capture from a real headset: at the front corners of the visor, turned
+// about 12 degrees out and 28 down, seeing about 150 degrees across.
 void strack_default_cameras(strack_camera out[STRACK_CAMERAS]);
 
 typedef struct {

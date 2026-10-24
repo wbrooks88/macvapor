@@ -174,11 +174,21 @@ static bool solve_n(int n, double *A, double *b) {
 // --------------------------------------------------------------------------------------- camera
 
 void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
+    // Fitted to a capture from a real headset (both controllers moving in front of the wearer, 60
+    // frames): the turn, centre and focal length that make the two cameras agree on where each
+    // controller is (to about a centimetre) and put the most LEDs on dots. The lenses are toed in
+    // by roll as well as yaw, and look about 28 degrees down.
+    static const float k[STRACK_CAMERAS][5] = {
+        // cx, cy, yaw, pitch, roll
+        {509.6f, 478.0f, 12.8f, -26.0f, -6.8f},
+        {500.5f, 508.0f, -11.0f, -30.0f, 6.4f},
+    };
     for (int i = 0; i < STRACK_CAMERAS; i++) {
         float side = i == 0 ? -1 : 1;
         out[i] = (strack_camera){
-            .f = 388, .cx = 508, .cy = 508, .k = {0, 0, 0, 0}, .max_angle_deg = 78, .width = 1016, .height = 1016,
-            .position = {side * 0.060f, -0.030f, -0.090f}, .yaw_deg = -side * 20, .pitch_deg = -35, .roll_deg = 0,
+            .f = 410.5f, .cx = k[i][0], .cy = k[i][1], .k = {0.03f, 0, 0, 0}, .max_angle_deg = 78,
+            .width = 1016, .height = 1016, .position = {side * 0.060f, -0.030f, -0.102f},
+            .yaw_deg = k[i][2], .pitch_deg = k[i][3], .roll_deg = k[i][4],
         };
     }
 }
@@ -771,9 +781,10 @@ static void head_from_world(const strack_input *in, const float R[9], const floa
 
 enum { CP = 6, NCP = STRACK_CAMERAS * CP };   // per camera: yaw, pitch, roll, log f, cx, cy
 
-// How far off the guess may be: 5 degrees of yaw and roll, 8 of pitch, 8% of the focal length and
-// 15 pixels of the centre. The calibration is held to the guess by that much.
-static const float k_cal_sigma[CP] = {5 * DEG, 8 * DEG, 5 * DEG, 0.08f, 15, 15};
+// How far off the starting cameras may be: 3 degrees of turn, 3% of the focal length and 8 pixels of
+// the centre. The calibration is held to them by that much; looser, it wandered by 20% and 15
+// degrees in the headset, trading focal length against distance, and the controllers jumped.
+static const float k_cal_sigma[CP] = {3 * DEG, 3 * DEG, 3 * DEG, 0.03f, 8, 8};
 
 static void camera_with(const strack_camera *base, const float d[CP], strack_camera *out, float R[9]) {
     *out = *base;
