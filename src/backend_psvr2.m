@@ -862,8 +862,12 @@ static void *tracking_thread(void *arg) {
             // LEDs: weak fits fed back here at a tenth a frame spun a controller half a turn in ten
             // seconds while it sat still. (Held to under 1.5 px as well, it hardly ever took any in,
             // and the IMU's drift showed.)
-            if (r[h].leds >= 6 && r[h].rms_px <= 2.5f) {
-                float a = 0.03f * r[h].yaw_error;
+            // Overhead a controller is often seen on only four or five LEDs, while its IMU's turn
+            // about its own length (the world's vertical, pointing up) goes unchecked by gravity
+            // and drifts; such fits correct it at half the rate, if they fit well.
+            float gain = r[h].leds >= 6 && r[h].rms_px <= 2.5f ? 0.03f : r[h].leds >= 4 && r[h].rms_px <= 1.5f ? 0.015f : 0;
+            if (gain > 0) {
+                float a = gain * r[h].yaw_error;
                 g_ctl_yaw[h] = qnorm(qmul(qyaw(a), g_ctl_yaw[h]));
                 strack_shift_yaw(g_tracker, h, a);
             }
