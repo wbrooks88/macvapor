@@ -48,6 +48,7 @@ typedef struct {
     int min_leds;           // LEDs that must be matched for a pose found from scratch
     float max_rms_px;       // and how well, on average
     float search_hz;        // how often to search for a controller that isn't being followed
+    bool calibrate;         // fit the cameras' turn, centre and focal length to what it sees
 } strack_params;
 
 void strack_default_params(strack_params *out);

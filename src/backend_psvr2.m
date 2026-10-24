@@ -681,10 +681,14 @@ static void *tracking_thread(void *arg) {
             if (!r[h].valid) continue;
             strack_filter_update(&g_optical[h], r[h].pose.p, exposed);
             g_optical_seen[h] = exposed;
-            // The IMU's yaw toward the cameras', a tenth at a time, so it doesn't jitter.
-            float a = 0.1f * r[h].yaw_error;
-            g_ctl_yaw[h] = qnorm(qmul(qyaw(a), g_ctl_yaw[h]));
-            strack_shift_yaw(g_tracker, h, a);
+            // The IMU's yaw toward the cameras', a little at a time, and only from fits on plenty of
+            // LEDs: weak fits fed back here at a tenth a frame spun a controller half a turn in ten
+            // seconds while it sat still.
+            if (r[h].leds >= 6 && r[h].rms_px <= 1.5f) {
+                float a = 0.03f * r[h].yaw_error;
+                g_ctl_yaw[h] = qnorm(qmul(qyaw(a), g_ctl_yaw[h]));
+                strack_shift_yaw(g_tracker, h, a);
+            }
             g_stat_track_seen[h]++;
             g_stat_track_leds[h] += r[h].leds;
             g_stat_track_rms[h] += r[h].rms_px;
@@ -714,6 +718,11 @@ static void start_controller_tracking(void) {
     load_cameras(cams);
     strack_params prm;
     strack_default_params(&prm);
+    // In the headset the calibration wandered (12 degrees and 15% in a minute), trading focal
+    // length and pitch against where the controllers are, and they jumped with it. The built-in
+    // cameras, fitted to a capture, do better left alone; PSVR2XR_CALIBRATE_CAMERAS=1 turns it on.
+    const char *cal = getenv("PSVR2XR_CALIBRATE_CAMERAS");
+    prm.calibrate = cal && atoi(cal);
     prm.threshold = g_cfg.controller_threshold;
     g_tracker = strack_create(cams, &prm);
     g_track_planes[0] = malloc(PSVR2_CAM_PLANE_BYTES);

@@ -80,6 +80,7 @@ int main(int argc, char **argv) {
     for (int c=0;c<2;c++) printf("cam %d: f %.1f c %.1f %.1f yaw %.1f pitch %.1f roll %.1f\n",c,cams[c].f,cams[c].cx,cams[c].cy,cams[c].yaw_deg,cams[c].pitch_deg,cams[c].roll_deg);
     strack_params prm; strack_default_params(&prm);
     if (getenv("THR")) prm.threshold=atof(getenv("THR"));
+    prm.calibrate = getenv("CAL") != NULL;   // off, as in the headset
     strack *t=strack_create(cams,&prm);
     snprintf(path,sizeof path,"%s/frames.jsonl",argv[1]);
     FILE *fl=fopen(path,"r");

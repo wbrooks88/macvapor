@@ -116,6 +116,7 @@ static id<MTLRenderPipelineState> g_scene;
 static id<MTLCommandQueue> g_queue;
 
 static void quit(const char *why) {
+    axr_log("self-test: quitting (%s)", why);
     printf("self-test: quitting (%s)\n", why);
     fflush(stdout);
     exit(0);
@@ -149,7 +150,9 @@ static void install_exits(void) {
     if (g_timeout_min > 0)
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)g_timeout_min * 60 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{ quit("timed out"); });
-    [NSApp activateIgnoringOtherApps:YES];
+    // MacVapoR yields activation to the self-test; take it (macOS 14 and later ignore the old way).
+    if (@available(macOS 14, *)) [NSApp activate];
+    else [NSApp activateIgnoringOtherApps:YES];
 }
 
 static void matrix_from(const float q[4], float m[16]) {   // x, y, z, w; column-major

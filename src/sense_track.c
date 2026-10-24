@@ -194,7 +194,7 @@ void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
 }
 
 void strack_default_params(strack_params *p) {
-    *p = (strack_params){.threshold = 170, .max_area = 600, .gate_px = 5, .min_leds = 5, .max_rms_px = 2.5f, .search_hz = 15};
+    *p = (strack_params){.threshold = 170, .max_area = 600, .gate_px = 5, .min_leds = 5, .max_rms_px = 2.5f, .search_hz = 15, .calibrate = true};
 }
 
 // The camera's axes in the head: OpenCV's x right, y down, z forward, turned by yaw, pitch, roll.
@@ -661,6 +661,12 @@ static int polish(const problem *pr, hpose *P, float wide_gate, match *m, float 
     return best;
 }
 
+// Where a hand can be: within arm's reach of the head and not above it. Ceiling lights and lamps
+// across the room fit a controller's LEDs now and then, a metre or two away.
+static bool reachable(const hpose *P) {
+    return norm3(P->p) < 1.0f && P->p[1] < 0.3f;
+}
+
 // Every dot near another, every pair of neighbouring LEDs, and every turn about the vertical that
 // the prior might be off by: the two LEDs on the two dots fix a position (the turn is known), and
 // the poses that put the most other LEDs on dots are refined.
@@ -668,9 +674,9 @@ static int search(const problem *base, bool locked, hpose *found, match *m, floa
     const strack *t = base->t;
     hypothesis best[HYPOTHESES];
     int nbest = 0;
-    // Unconfirmed, the prior's yaw is still roughly right: the runtime turns a controller to point
-    // where the head faces when it connects and when its PS button is pressed.
-    int steps = locked ? 3 : 19;
+    // Unconfirmed, it may be off by anything: an IMU's yaw drifts, and in the headset one was off
+    // by 80 degrees after a minute, outside a search of 90 either way once the last fit is counted.
+    int steps = locked ? 3 : 36;
     float step = locked ? 8 * DEG : 10 * DEG;
     for (int s = 0; s < steps; s++) {
         float yaw = (s - steps / 2) * step, Ryaw[9];
@@ -730,7 +736,7 @@ static int search(const problem *base, bool locked, hpose *found, match *m, floa
                         match mm2[MAX_MATCHES];
                         float sse;
                         int n = match_pose(t, base->hand, &P, t->prm.gate_px * 1.6f, 3, mm2, &sse);
-                        if (n >= 3) keep_hypothesis(best, &nbest, &P, n, sse);
+                        if (n >= 3 && reachable(&P)) keep_hypothesis(best, &nbest, &P, n, sse);
                     }
                 }
             }
@@ -1086,7 +1092,9 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     hs->t_ns = in->time_ns;
     memcpy(hs->R, R, sizeof R);
     memcpy(hs->p, p, sizeof p);
-    hs->locked_until_ns = in->time_ns + 2000000000LL;
+    // Only a fit on plenty of LEDs confirms the yaw: one on three or four can be turned well off
+    // the truth, and locked onto that the search never looks wider again.
+    if (n >= 6) hs->locked_until_ns = in->time_ns + 2000000000LL;
     o->valid = true;
     o->found = found;
     mat_to_quat(R, o->pose.q);
@@ -1099,7 +1107,7 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
 static bool search_hand(strack *t, hand_job *j, hpose *P, match *m, int *n, float *rms) {
     *rms = 1e9f;
     *n = search(&j->pr, j->locked, P, m, rms);
-    return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= t->prm.max_rms_px;
+    return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= t->prm.max_rms_px && reachable(P);
 }
 
 void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
@@ -1150,7 +1158,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         // A hand doesn't jump: a fit far from where it was going is on someone else's dots.
         float jump[3];
         for (int k = 0; k < 3; k++) jump[k] = P.p[k] - start.p[k];
-        if (norm3(jump) > 0.06f + 3 * j->dt) continue;
+        if (norm3(jump) > 0.06f + 3 * j->dt || !reachable(&P)) continue;
         accept(t, in, h, j, &P, m, n, rms, false, &out[h]);
     }
 
@@ -1204,7 +1212,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         accept(t, in, h, &jobs[h], &sp[h], sm[h], sn[h], srms[h], true, &out[h]);
     }
 
-    if (t->ncal >= 15 && t->cal_new >= 8 && in->time_ns - t->last_cal_ns > 2000000000LL) {
+    if (t->prm.calibrate && t->ncal >= 15 && t->cal_new >= 8 && in->time_ns - t->last_cal_ns > 2000000000LL) {
         t->last_cal_ns = in->time_ns;
         t->cal_new = 0;
         calibrate(t);

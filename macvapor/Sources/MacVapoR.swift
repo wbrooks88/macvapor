@@ -454,17 +454,27 @@ final class Model: ObservableObject {
         case .foveated: p.arguments = ["--foveated"]
         case .captureControllers: p.arguments = ["--capture-controllers"]
         }
-        p.terminationHandler = { _ in Task { @MainActor in self.selftest = nil } }
+        p.terminationHandler = { _ in Task { @MainActor in self.selftestEnded() } }
         do {
             try p.run()
             selftest = p
+            // The self-test takes the keyboard for Esc if macOS lets it; when it doesn't (it won't
+            // take focus from the app that started it), Esc reaches MacVapoR, so stop it from here.
+            if let app = NSRunningApplication(processIdentifier: p.processIdentifier) {
+                NSApp.yieldActivation(to: app)
+            }
+            escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+                guard e.keyCode == 53, let self, self.selftest != nil else { return e }
+                self.stopSelftest()
+                return nil
+            }
             switch mode {
             case .calibrateEyes:
                 output = "Eye calibration: put the headset on and look at each dot until the next one appears (13 dots, about a minute). Press Stop when the test room comes back."
             case .foveated:
                 output = "Foveated test: the test room, with the sharp area tinted orange. It should follow your eyes, with a yellow ring where you look."
             case .captureControllers:
-                output = "Controller capture: the test room, while camera frames are saved to the PS VR2 Controller Capture folder on your Desktop. Hold both controllers in front of you and move them around slowly for 30 seconds, then press Stop and send Claude that folder as a zip."
+                output = "Controller capture: the test room, while camera frames are saved to the PS VR2 Controller Capture folder on your Desktop. Hold both controllers in front of you and move them around slowly for 10 seconds, then press Stop and send Claude that folder as a zip."
             default:
                 output = "Self-test running: put the headset on. You should see a floor grid and four pillars: red ahead, green right, blue behind, yellow left."
             }
@@ -472,6 +482,14 @@ final class Model: ObservableObject {
         } catch {
             output = "Could not start the self-test: \(error.localizedDescription)"
         }
+    }
+
+    private var escMonitor: Any?
+
+    private func selftestEnded() {
+        selftest = nil
+        if let m = escMonitor { NSEvent.removeMonitor(m) }
+        escMonitor = nil
     }
 
     /// Asks the self-test to quit, then kills it if it hasn't after two seconds.
