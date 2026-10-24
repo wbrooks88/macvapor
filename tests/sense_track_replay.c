@@ -9,7 +9,7 @@
 //
 // The cameras start from the built-in ones, or the capture's controller_cameras.json with
 // "capture". CAMS="f cx cy yaw pitch roll" x2 overrides the lower pair, UPPER the same for the
-// upper pair (and turns it on), K1 the lenses' k1 and POS="x y z" the lower pair's position (the
+// upper pair (and turns it on), UPOS the same for the upper pair, K1 the lenses' k1 and POS="x y z" the lower pair's position (the
 // left one's x is -x); THR sets the dot threshold, CAL turns calibration on, BLIND=c drops camera
 // c's picture, NOIMG skips the drawing.
 
@@ -161,6 +161,11 @@ int main(int argc, char **argv) {
     }
     if (getenv("CAMS")) set_pair(cams, getenv("CAMS"));
     if (getenv("UPPER")) { set_pair(cams + 2, getenv("UPPER")); cams[2].off = cams[3].off = false; }
+    if (getenv("UPOS")) {
+        float x, y, z;
+        if (sscanf(getenv("UPOS"), "%f %f %f", &x, &y, &z) == 3)
+            for (int c = 2; c < 4; c++) { cams[c].position[0] = c == 3 ? x : -x; cams[c].position[1] = y; cams[c].position[2] = z; }
+    }
     if (getenv("K1")) for (int c = 0; c < STRACK_CAMERAS; c++) cams[c].k[0] = atof(getenv("K1"));
     if (getenv("POS")) {
         float x, y, z;

@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     strack_camera cams[STRACK_CAMERAS], on[STRACK_CAMERAS];
     strack_default_cameras(cams);
     memcpy(on, cams, sizeof on);
-    for (int c = 2; c < STRACK_CAMERAS; c++) { on[c].off = false; on[c].max_angle_deg = 85; }
+    for (int c = 2; c < STRACK_CAMERAS; c++) { on[c].off = false; on[c].max_angle_deg = 85; cams[c].off = true; }
     strack_params prm;
     strack_default_params(&prm);
     prm.calibrate = false;

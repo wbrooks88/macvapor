@@ -184,8 +184,8 @@ void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
         // cx, cy, yaw, pitch, roll
         {509.6f, 478.0f, 12.8f, -26.0f, -6.8f},
         {500.5f, 508.0f, -11.0f, -30.0f, 6.4f},
-        {503.3f, 516.4f, 30.4f, 12.0f, -31.4f},
-        {507.4f, 510.5f, -29.9f, 8.0f, 24.8f},
+        {504.5f, 516.4f, 30.5f, 10.2f, -29.9f},
+        {508.0f, 513.6f, -30.6f, 8.1f, 24.1f},
     };
     for (int i = 0; i < STRACK_CAMERAS; i++) {
         float side = i % 2 == 0 ? -1 : 1, up = i >= 2 ? 1 : -1;
@@ -650,6 +650,12 @@ static void keep_hypothesis(hypothesis *best, int *nbest, const hpose *P, int n,
     best[i] = (hypothesis){*P, n, sse};
 }
 
+// How far off a fit on n LEDs may be, on average: further with many, where a few pixels of camera
+// model error add up over cameras but a wrong pose can't put that many LEDs on dots.
+static float rms_limit(const strack *t, int n) {
+    return t->prm.max_rms_px * (n >= 8 ? 1.5f : 1);
+}
+
 // Fits a pose starting from P with the cameras in cams: match within a wide gate, refine, match
 // again closely, refine. Returns the LEDs matched at the end, the matches in m and the root mean
 // square error in rms.
@@ -673,16 +679,16 @@ static int polish(const problem *pr, hpose *P, float wide_gate, match *m, float 
     const strack *t = pr->t;
     hpose start = *P;
     int n = polish_with(pr, P, wide_gate, ALL_CAMS, m, rms);
-    if (n >= 2 && *rms <= t->prm.max_rms_px) return n;
+    if (n >= 2 && *rms <= rms_limit(t, n)) return n;
     int best = n;
     for (int c = 0; c < STRACK_CAMERAS; c++) {
         hpose Q = start;
         match mc[MAX_MATCHES];
         float r;
         int k = polish_with(pr, &Q, wide_gate, 1 << c, mc, &r);
-        if (k < 2 || r > t->prm.max_rms_px) continue;
-        if (*rms <= t->prm.max_rms_px * 1.4f && best >= k) continue;   // the joint fit is about as good
-        if (best >= 2 && *rms <= t->prm.max_rms_px && best >= k) continue;
+        if (k < 2 || r > rms_limit(t, k)) continue;
+        if (*rms <= rms_limit(t, best) * 1.4f && best >= k) continue;   // the joint fit is about as good
+        if (best >= 2 && *rms <= rms_limit(t, best) && best >= k) continue;
         best = k;
         *rms = r;
         *P = Q;
@@ -1151,7 +1157,7 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
 static bool search_hand(strack *t, hand_job *j, hpose *P, match *m, int *n, float *rms) {
     *rms = 1e9f;
     *n = search(&j->pr, j->range, P, m, rms);
-    return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= t->prm.max_rms_px && reachable(P);
+    return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= rms_limit(t, *n) && reachable(P);
 }
 
 void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
@@ -1203,7 +1209,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         hpose start = P;
         int n = polish(&j->pr, &P, t->prm.gate_px * 3, m, &rms);
         bool two_ok = t->hs[h].leds >= 4;   // two LEDs only right after seeing plenty
-        if (!(n >= 3 || (n == 2 && two_ok)) || rms > t->prm.max_rms_px * (n == 2 ? 0.6f : 1.4f)) continue;
+        if (!(n >= 3 || (n == 2 && two_ok)) || rms > rms_limit(t, n) * (n == 2 ? 0.6f : 1.4f)) continue;
         // A hand doesn't jump: a fit far from where it was going is on someone else's dots.
         float jump[3];
         for (int k = 0; k < 3; k++) jump[k] = P.p[k] - start.p[k];
