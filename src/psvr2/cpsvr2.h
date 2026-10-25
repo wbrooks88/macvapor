@@ -81,6 +81,23 @@ typedef void (*psvr2_tracking_listener)(const unsigned char *header, int upper, 
                                         const unsigned char *right, double arrived_s, void *ctx);
 void psvr2_camera_set_tracking_listener(psvr2_tracking_listener fn, void *ctx);
 
+/* The headset's own spot finder ('L','D' packets on interface 8, EP 0x89), streaming while the
+ * cameras do, 60 times a second. Each packet covers one exposure of all four cameras:
+ *   0x00  'L','D'; bytes 8..11 the exposure time in headset microseconds, as in the cameras'
+ *         headers; bytes 0x10, 0x12 the pictures' width and height (508)
+ *   0x40  four cameras (lower left, lower right, upper left, upper right), PSVR2_LD_CAMERA_BYTES
+ *         each: a uint32 count, then up to 256 spots of 36 bytes:
+ *           u16 kind (1; 2 for some faint ones beside a bigger spot), u8 peak value, u8 ?,
+ *           u16 x0, x1, y0, y1 (the spot's box in the half-size picture's pixels, inclusive),
+ *           u32 sums over the box of w, w*dx, w*dy, w*dx*dy, w*dx*dx, w*dy*dy, where w is a
+ *           pixel's value less 32 (pixels above it only) and dx, dy are from x0, y0.
+ * Called on its own thread with each packet; only valid during the call. NULL stops it. */
+#define PSVR2_LD_PACKET_BYTES 36944
+#define PSVR2_LD_CAMERA_BYTES 9220
+#define PSVR2_LD_SPOT_BYTES 36
+typedef void (*psvr2_led_detector_listener)(const unsigned char *packet, double arrived_s, void *ctx);
+void psvr2_camera_set_led_detector_listener(psvr2_led_detector_listener fn, void *ctx);
+
 /* Called on the camera thread with every frame as it arrives: the packet's 256-byte header, the
  * two BC4 planes (left camera, right camera; PSVR2_CAM_PLANE_BYTES each, 256 blocks to a row), and
  * the CLOCK_MONOTONIC second it arrived. The planes are only valid during the call. NULL stops it. */

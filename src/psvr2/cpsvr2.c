@@ -28,6 +28,10 @@
 #define CAMERA_HEADER_BYTES 256
 #define CAMERA_MODE_TRACKING 4
 #define CAMERA_MODE_BC4 0x10
+/* The headset's own spot finder ('L','D'), on interface 8 (Monado's psvr2.c calls it the LED
+ * detector); see psvr2_led_detector_listener */
+#define LD_INTERFACE 8
+#define LD_ENDPOINT 0x89
 
 #define GYRO_SCALE (2000.0f / 32767.0f)
 #define DEG_TO_RAD(d) ((d) * (float)M_PI / 180.0f)
@@ -104,6 +108,10 @@ static psvr2_camera_listener g_camera_listener;
 static void *g_camera_listener_ctx;
 static psvr2_tracking_listener g_tracking_listener;
 static void *g_tracking_listener_ctx;
+static psvr2_led_detector_listener g_ld_listener;
+static void *g_ld_listener_ctx;
+static pthread_t g_ld_thread;
+static int g_ld_claimed;
 static void camera_off(void);
 
 /* Gyro integration corrected toward SLAM poses (see fusion.c) */
@@ -507,6 +515,38 @@ static void *camera_thread_fn(void *arg)
 	return NULL;
 }
 
+static void *ld_thread_fn(void *arg)
+{
+	(void)arg;
+	unsigned char *buf = malloc(PSVR2_LD_PACKET_BYTES + 4096);
+	if (buf == NULL) {
+		return NULL;
+	}
+	while (g_camera_running) {
+		int transferred = 0;
+		int ret = libusb_bulk_transfer(g_dev, LD_ENDPOINT, buf, PSVR2_LD_PACKET_BYTES + 4096, &transferred, 300);
+		if (ret == LIBUSB_ERROR_TIMEOUT) {
+			continue;
+		}
+		if (ret != 0) {
+			break;
+		}
+		if (transferred != PSVR2_LD_PACKET_BYTES || buf[0] != 'L' || buf[1] != 'D') {
+			continue;
+		}
+		double arrived = monotonic_s();
+		pthread_mutex_lock(&g_camera_lock);
+		psvr2_led_detector_listener fn = g_ld_listener;
+		void *ctx = g_ld_listener_ctx;
+		pthread_mutex_unlock(&g_camera_lock);
+		if (fn != NULL) {
+			fn(buf, arrived, ctx);
+		}
+	}
+	free(buf);
+	return NULL;
+}
+
 static int camera_on(void)
 {
 	if (g_camera_running) {
@@ -542,6 +582,15 @@ static int camera_on(void)
 		libusb_release_interface(g_dev, CAMERA_INTERFACE);
 		return -1;
 	}
+	/* The spot finder streams while the cameras do; without it tracking reads the pictures */
+	g_ld_claimed = libusb_claim_interface(g_dev, LD_INTERFACE) == 0;
+	if (g_ld_claimed && pthread_create(&g_ld_thread, NULL, ld_thread_fn, NULL) != 0) {
+		libusb_release_interface(g_dev, LD_INTERFACE);
+		g_ld_claimed = 0;
+	}
+	if (!g_ld_claimed) {
+		fprintf(stderr, "psvr2: LED detector interface busy\n");
+	}
 	return 0;
 }
 
@@ -552,6 +601,11 @@ static void camera_off(void)
 	}
 	g_camera_running = 0;
 	pthread_join(g_camera_thread, NULL);
+	if (g_ld_claimed) {
+		pthread_join(g_ld_thread, NULL);
+		libusb_release_interface(g_dev, LD_INTERFACE);
+		g_ld_claimed = 0;
+	}
 	camera_power(0);
 	libusb_release_interface(g_dev, CAMERA_INTERFACE);
 }
@@ -609,6 +663,14 @@ void psvr2_camera_set_tracking_listener(psvr2_tracking_listener fn, void *ctx)
 	pthread_mutex_lock(&g_camera_lock);
 	g_tracking_listener = fn;
 	g_tracking_listener_ctx = ctx;
+	pthread_mutex_unlock(&g_camera_lock);
+}
+
+void psvr2_camera_set_led_detector_listener(psvr2_led_detector_listener fn, void *ctx)
+{
+	pthread_mutex_lock(&g_camera_lock);
+	g_ld_listener = fn;
+	g_ld_listener_ctx = ctx;
 	pthread_mutex_unlock(&g_camera_lock);
 }
 

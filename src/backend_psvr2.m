@@ -519,6 +519,15 @@ static unsigned char *g_track_half[STRACK_CAMERAS], g_track_half_header[2][256];
 static bool g_track_has[STRACK_CAMERAS];
 static double g_track_arrived;
 static bool g_track_pending, g_track_is_half;
+// The headset's spot finder (cpsvr2.h): its newest packet, for captures; and, while the cameras are
+// in the tracking mode, the dots of all four cameras on every exposure, where the pictures bring
+// the upper pair only every other one. PSVR2XR_TRACK_SPOTS=0 goes back to finding them in the
+// pictures.
+static unsigned char g_ld_packet[4][PSVR2_LD_PACKET_BYTES], g_track_ld[PSVR2_LD_PACKET_BYTES];   // the last 4
+static unsigned g_ld_count;
+static double g_stat_ld_ahead_s; static unsigned g_stat_ld_ahead_n;   // under g_track_lock
+static bool g_ld_have, g_track_is_spots, g_use_spots;
+static double g_ld_arrived, g_half_arrived, g_ld_packet_arrived[4];
 // The lower pair waits here for the upper pair taken at the same moment.
 static unsigned char *g_lower_wait[2], g_lower_wait_header[256];
 static double g_lower_wait_arrived;
@@ -538,6 +547,7 @@ static void camera_frame(const unsigned char *header, const unsigned char *left,
     memcpy(g_track_header, header, sizeof g_track_header);
     g_track_arrived = arrived_s;
     g_track_is_half = false;
+    g_track_is_spots = false;
     g_track_pending = true;
     pthread_cond_signal(&g_track_cond);
     pthread_mutex_unlock(&g_track_lock);
@@ -552,6 +562,7 @@ static uint32_t g_expose_last_us;
 static int g_expose_n;
 static double g_expose_period_us = 16683;
 static _Atomic int64_t g_led_shift_ns = -1;   // -1: not searched yet
+static _Atomic int64_t g_expose_off_ns = INT64_MIN;   // our clock less the headset's, at the quickest arrival
 
 static void led_timing(const unsigned char *header, double arrived_s) {
     uint32_t us = (uint32_t)header[8] | (uint32_t)header[9] << 8 | (uint32_t)header[10] << 16 | (uint32_t)header[11] << 24;
@@ -571,6 +582,7 @@ static void led_timing(const unsigned char *header, double arrived_s) {
     int64_t off = INT64_MAX;
     for (int i = 0; i < n; i++)
         if (g_expose_arrival_off[i] < off) off = g_expose_arrival_off[i];
+    if (n >= 30) g_expose_off_ns = off;
     int64_t shift = g_led_shift_ns;
     if (n >= 30 && shift >= 0)
         sense_led_timing(g_expose_us64 * 1000 + off, (int64_t)(g_expose_period_us * 1000), shift);
@@ -603,7 +615,46 @@ static void tracking_frame(const unsigned char *header, int upper, const unsigne
         g_track_has[2] = g_track_has[3] = true;
         g_track_arrived = pair ? g_lower_wait_arrived : arrived_s;
         g_lower_waiting = false;
-        g_track_is_half = true;
+        g_half_arrived = arrived_s;
+        // How much sooner the spot finder brought this exposure.
+        for (int i = 0; i < 4 && g_ld_have; i++)
+            if (!memcmp(g_ld_packet[i] + 8, header + 8, 4)) {
+                g_stat_ld_ahead_s += arrived_s - g_ld_packet_arrived[i];
+                g_stat_ld_ahead_n++;
+            }
+        // The pictures stay for captures while the spot finder drives the tracker.
+        if (!(g_use_spots && g_ld_have && arrived_s - g_ld_arrived < 0.2)) {
+            g_track_is_half = true;
+            g_track_is_spots = false;
+            g_track_pending = true;
+            pthread_cond_signal(&g_track_cond);
+        }
+    }
+    pthread_mutex_unlock(&g_track_lock);
+}
+
+// Each spot finder packet: the exposure it covers, in our clock as a lower pair arriving with it
+// would have come (led_timing's tie), so tracking_thread takes off the same latency.
+static void led_detector_frame(const unsigned char *packet, double arrived_s, void *ctx) {
+    (void)ctx;
+    uint32_t us = (uint32_t)packet[8] | (uint32_t)packet[9] << 8 | (uint32_t)packet[10] << 16 | (uint32_t)packet[11] << 24;
+    int64_t off = g_expose_off_ns;
+    double exposed_arrival = arrived_s;
+    if (off != INT64_MIN && g_expose_n) {
+        int64_t us64 = g_expose_us64 + (int32_t)(us - g_expose_last_us);
+        exposed_arrival = (us64 * 1000 + off) / 1e9;
+    }
+    pthread_mutex_lock(&g_track_lock);
+    g_ld_packet_arrived[g_ld_count % 4] = arrived_s;
+    memcpy(g_ld_packet[g_ld_count++ % 4], packet, PSVR2_LD_PACKET_BYTES);
+    g_ld_have = true;
+    g_ld_arrived = arrived_s;
+    // Only in the tracking mode (pictures coming half-size lately), not passthrough's.
+    if (g_use_spots && arrived_s - g_half_arrived < 0.5) {
+        memcpy(g_track_ld, packet, PSVR2_LD_PACKET_BYTES);
+        g_track_arrived = exposed_arrival;
+        g_track_is_spots = true;
+        g_track_is_half = false;
         g_track_pending = true;
         pthread_cond_signal(&g_track_cond);
     }
@@ -696,6 +747,22 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
         }
     }
     if (f) fclose(f);
+    // The spot finder's packet for the same exposure beside it (ld_NNN.bin), or its newest.
+    pthread_mutex_lock(&g_track_lock);
+    bool ld = g_ld_have;
+    static unsigned char ld_copy[PSVR2_LD_PACKET_BYTES];
+    if (ld) {
+        int pick = (g_ld_count - 1) % 4;
+        for (int i = 0; i < 4 && half; i++)
+            if (!memcmp(g_ld_packet[i] + 8, headers[1] + 8, 4)) pick = i;
+        memcpy(ld_copy, g_ld_packet[pick], sizeof ld_copy);
+    }
+    pthread_mutex_unlock(&g_track_lock);
+    if (ld) {
+        NSString *ld_name = [NSString stringWithFormat:@"ld_%03u.bin", g_capture_saved - 1];
+        FILE *lf = fopen([g_capture_dir stringByAppendingPathComponent:ld_name].fileSystemRepresentation, "wb");
+        if (lf) { fwrite(ld_copy, 1, sizeof ld_copy, lf); fclose(lf); }
+    }
     fprintf(g_capture, "{\"file\": \"%s\", \"time_ns\": %lld, \"head\": {\"q\": [%.6f, %.6f, %.6f, %.6f], \"p\": [%.4f, %.4f, %.4f]}",
             name.UTF8String, (long long)in->time_ns, in->head.q[0], in->head.q[1], in->head.q[2], in->head.q[3],
             in->head.p[0], in->head.p[1], in->head.p[2]);
@@ -727,8 +794,10 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
 // Finds where in the frame the LEDs must flash to be in the pictures: each shift in turn (1.5 ms
 // apart, the flash being 2.1 ms long) for a few frames, counting the dots; the most dots win, then
 // half a step either side. Searched again when the dots fall away for a while.
-static void led_search(int dots) {
-    enum { STEP_NS = 1500000, SETTLE = 4, COUNT = 6 };
+static void led_search(int dots, bool spots) {
+    enum { STEP_NS = 1500000 };
+    // in frames: the pictures' four cameras come 30 times a second, the spot finder's 60
+    const int SETTLE = spots ? 8 : 4, COUNT = spots ? 12 : 6;
     static int step = -1, nsteps, frame, refine;
     static double sum, means[16], best, dark, level;
     static int64_t base, coarse, last_search_ns;
@@ -794,6 +863,7 @@ static void *tracking_thread(void *arg) {
     unsigned char *planes[2] = {malloc(PSVR2_CAM_PLANE_BYTES), malloc(PSVR2_CAM_PLANE_BYTES)}, header[256];
     unsigned char *pictures[STRACK_CAMERAS], headers[2][256];
     bool has[STRACK_CAMERAS];
+    static unsigned char ld[PSVR2_LD_PACKET_BYTES];
     for (int c = 0; c < STRACK_CAMERAS; c++)
         if (!(pictures[c] = malloc(PSVR2_TRACK_PICTURE_BYTES))) return NULL;
     if (!planes[0] || !planes[1]) return NULL;
@@ -803,8 +873,16 @@ static void *tracking_thread(void *arg) {
         pthread_mutex_lock(&g_track_lock);
         while (!g_track_pending) pthread_cond_wait(&g_track_cond, &g_track_lock);
         g_track_pending = false;
-        bool half = g_track_is_half;
-        if (half) {
+        bool half = g_track_is_half, spots = g_track_is_spots;
+        if (spots) {
+            memcpy(ld, g_track_ld, sizeof ld);
+            // and the newest pictures, for a capture
+            for (int c = 0; c < STRACK_CAMERAS; c++) {
+                has[c] = g_track_has[c];
+                if (g_capture && has[c]) memcpy(pictures[c], g_track_half[c], PSVR2_TRACK_PICTURE_BYTES);
+            }
+            if (g_capture) memcpy(headers, g_track_half_header, sizeof headers);
+        } else if (half) {
             for (int c = 0; c < STRACK_CAMERAS; c++) {
                 has[c] = g_track_has[c];
                 if (has[c]) memcpy(pictures[c], g_track_half[c], PSVR2_TRACK_PICTURE_BYTES);
@@ -824,7 +902,9 @@ static void *tracking_thread(void *arg) {
         }
         int dots[STRACK_CAMERAS] = {0};
         for (int c = 0; c < STRACK_CAMERAS; c++) {
-            if (half && has[c])   // the last 4 columns are padding
+            if (spots)
+                dots[c] = strack_detect_spots(g_tracker, c, ld + 0x40 + c * PSVR2_LD_CAMERA_BYTES);
+            else if (half && has[c])   // the last 4 columns are padding
                 dots[c] = strack_detect_half(g_tracker, c, pictures[c], PSVR2_TRACK_WIDTH - 4, PSVR2_TRACK_HEIGHT,
                                              PSVR2_TRACK_WIDTH);
             else if (!half && c < 2)
@@ -832,7 +912,7 @@ static void *tracking_thread(void *arg) {
             else
                 strack_no_picture(g_tracker, c);
         }
-        if (half) led_search(dots[0] + dots[1] + dots[2] + dots[3]);
+        if (half || spots) led_search(dots[0] + dots[1] + dots[2] + dots[3], spots);
 
         // The head then, and each controller's orientation from its IMU.
         strack_input in = {.time_ns = exposed};
@@ -882,7 +962,7 @@ static void *tracking_thread(void *arg) {
         }
         pthread_mutex_unlock(&g_lock);
 
-        capture_frame(half, header, planes, headers, pictures, has, &in, r);
+        capture_frame(half || spots, header, planes, headers, pictures, has, &in, r);
         float rms;
         int calibrations = strack_calibration(g_tracker, &rms);
         if (calibrations > saved_calibrations && axr_now_ns() - last_save > 20000000000LL) {
@@ -937,10 +1017,14 @@ static void start_controller_tracking(void) {
     }
     psvr2_camera_set_listener(camera_frame, NULL);
     psvr2_camera_set_tracking_listener(tracking_frame, NULL);
+    const char *spots = getenv("PSVR2XR_TRACK_SPOTS");
+    g_use_spots = !spots || atoi(spots);
+    psvr2_camera_set_led_detector_listener(led_detector_frame, NULL);
     if (psvr2_camera_start_tracking() != 0) {
         axr_log("controller tracking: the headset's cameras did not start; using the arm model");
         psvr2_camera_set_listener(NULL, NULL);
         psvr2_camera_set_tracking_listener(NULL, NULL);
+        psvr2_camera_set_led_detector_listener(NULL, NULL);
         return;
     }
     sense_tracking_leds(true);
@@ -1770,10 +1854,18 @@ static void *status_thread(void *arg) {
                                  sense_leds_on(h) ? "" : " (its LEDs are off: is it connected?)");
                 }
                 double fr = frames ? frames : 1;
+                pthread_mutex_lock(&g_track_lock);
+                bool spots = g_track_is_spots;
+                double ahead = g_stat_ld_ahead_n ? g_stat_ld_ahead_s / g_stat_ld_ahead_n : 0;
+                g_stat_ld_ahead_s = 0;
+                g_stat_ld_ahead_n = 0;
+                pthread_mutex_unlock(&g_track_lock);
                 axr_log("controller tracking: %.0f camera frames/s, %.1f/%.1f/%.1f/%.1f dots a frame (lower left/right,"
-                        " upper left/right camera); left %s; right %s; cameras calibrated %d times%s",
-                        frames / dt, dots[0] / fr, dots[1] / fr, dots[2] / fr, dots[3] / fr, side[0], side[1], cal,
-                        cal ? [NSString stringWithFormat:@" (fit %.2f px)", cal_rms].UTF8String : "");
+                        " upper left/right camera, %s; the spot finder's come %.1f ms before the pictures); left %s;"
+                        " right %s; cameras calibrated %d times%s",
+                        frames / dt, dots[0] / fr, dots[1] / fr, dots[2] / fr, dots[3] / fr,
+                        spots ? "from the headset's spot finder" : "found in the pictures", ahead * 1e3, side[0], side[1],
+                        cal, cal ? [NSString stringWithFormat:@" (fit %.2f px)", cal_rms].UTF8String : "");
             }
             if (g_eyes_on) {
                 psvr2_gaze g;

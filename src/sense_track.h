@@ -102,6 +102,10 @@ int strack_detect_gray(strack *t, int cam, const uint8_t *pixels, int stride);
 // From a half-size 8-bit picture (the headset's tracking mode, width by height); the dots come out
 // in the full frame's pixels, as the camera model has them. Nothing for a camera that is off.
 int strack_detect_half(strack *t, int cam, const uint8_t *pixels, int width, int height, int stride);
+// From the headset's own spot finder: block is one camera's part of an LED detector packet (a
+// count and 36-byte spots; see cpsvr2.h), the spots in the half-size picture's pixels. Spots go
+// through the same tests as dots found in a picture, bar the look at what's around them.
+int strack_detect_spots(strack *t, int cam, const uint8_t *block);
 // No picture from this camera this frame.
 void strack_no_picture(strack *t, int cam);
 const strack_blob *strack_blobs(const strack *t, int cam, int *count);

@@ -485,6 +485,43 @@ int strack_detect_bc4(strack *t, int cam, const uint8_t *bc4, int stride_blocks)
     return t->nblobs[cam];
 }
 
+// The headset's spot finder lists, for each spot over 32 in a half-size picture, its box and sums
+// of w, w*dx, w*dy, w*dx*dy, w*dx*dx, w*dy*dy (w a pixel's value less 32, dx and dy from the box's
+// corner). At 32 an LED's dot takes in its glow, and the grey around a bit of lit screen or a lamp
+// joins it into one big spot, so the size test stands in for fill_blob()'s ring test. Its centres
+// are within a quarter of a pixel of fill_blob()'s.
+int strack_detect_spots(strack *t, int cam, const uint8_t *block) {
+    t->nblobs[cam] = 0;
+    const strack_camera *c = &t->cam[cam];
+    if (c->off) return 0;
+    uint32_t n = (uint32_t)block[0] | (uint32_t)block[1] << 8 | (uint32_t)block[2] << 16 | (uint32_t)block[3] << 24;
+    if (n > 256) n = 256;
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *r = block + 4 + k * 36;
+        int peak = r[2];
+        int x0 = r[4] | r[5] << 8, x1 = r[6] | r[7] << 8, y0 = r[8] | r[9] << 8, y1 = r[10] | r[11] << 8;
+        uint32_t m[6];
+        for (int i = 0; i < 6; i++)
+            m[i] = (uint32_t)r[12 + 4 * i] | (uint32_t)r[13 + 4 * i] << 8 | (uint32_t)r[14 + 4 * i] << 16 |
+                   (uint32_t)r[15 + 4 * i] << 24;
+        if (peak < t->prm.threshold || m[0] == 0 || x1 < x0 || y1 < y0) continue;
+        int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+        // On the bench every single LED's box was under 300 pixels, and every bigger box was LEDs
+        // run together at 32, its centre between them (their moments don't split them well: a
+        // lone LED seen from the side is as long).
+        if (bw * bh > t->prm.max_area / 2) continue;
+        if (bw > 3 * bh + 2 || bh > 3 * bw + 2) continue;          // streaks and edges, not dots
+        double mx = (double)m[1] / m[0], my = (double)m[2] / m[0];
+        strack_blob b = {.x = (float)((x0 + mx + 0.5) * 2), .y = (float)((y0 + my + 0.5) * 2),
+                         .brightness = (float)m[0], .area = bw * bh};
+        if (b.x >= c->width || b.y >= c->height) continue;
+        strack_unproject(c, b.x, b.y, b.ray);
+        if (b.ray[2] < cosf(c->max_angle_deg * DEG)) continue;
+        add_blob(t, cam, &b);
+    }
+    return t->nblobs[cam];
+}
+
 const strack_blob *strack_blobs(const strack *t, int cam, int *count) {
     *count = t->nblobs[cam];
     return t->blobs[cam];

@@ -11,7 +11,8 @@
 // "capture". CAMS="f cx cy yaw pitch roll" x2 overrides the lower pair, UPPER the same for the
 // upper pair (and turns it on), UPOS the same for the upper pair, K1 the lenses' k1 and POS="x y z" the lower pair's position (the
 // left one's x is -x); THR sets the dot threshold, CAL turns calibration on, BLIND=c drops camera
-// c's picture, NOIMG skips the drawing.
+// c's picture, NOIMG skips the drawing. SPOTS=1 takes the dots from the headset's spot finder
+// (ld_NNN.bin beside each frame) instead of the pictures, where the capture has them.
 
 #include "sense_track.h"
 
@@ -186,6 +187,8 @@ int main(int argc, char **argv) {
     unsigned char *buf = malloc(2 * (256 + 2 * TP) + 256 + 2 * PB);
     const char *bl = getenv("BLIND");
     int blind = bl ? atoi(bl) : -1, frame = 0;
+    int use_spots = getenv("SPOTS") && atoi(getenv("SPOTS"));
+    static unsigned char ld[36944];
     while (fgets(line, sizeof line, fl)) {
         char name[64];
         const char *fp = strstr(line, "\"file\": \"");
@@ -215,6 +218,14 @@ int main(int argc, char **argv) {
             in.prior_valid[h] = strstr(tmp, "\"imu\": true") != NULL;
             if (in.prior_valid[h]) jarr(tmp, "prior_q", in.prior_q[h], 4);
         }
+        bool spots = false;
+        if (use_spots) {
+            char ldname[96];
+            snprintf(ldname, sizeof ldname, "%s/ld_%.3s.bin", argv[1], name + 6);
+            FILE *fs = fopen(ldname, "rb");
+            spots = fs && fread(ld, 1, sizeof ld, fs) == sizeof ld && ld[0] == 'L' && ld[1] == 'D';
+            if (fs) fclose(fs);
+        }
         // The pictures: BC4 planes, or each pair's header and two half-size pictures.
         const unsigned char *pic[STRACK_CAMERAS] = {0};
         bool have[STRACK_CAMERAS] = {false};
@@ -227,7 +238,9 @@ int main(int argc, char **argv) {
                 have[c] = true;
                 pic[c] = buf + 256 + c * PB;
             }
-            if (!have[c] || c == blind) strack_no_picture(t, c);
+            if (c == blind) strack_no_picture(t, c);
+            else if (spots) strack_detect_spots(t, c, ld + 0x40 + c * 9220);
+            else if (!have[c]) strack_no_picture(t, c);
             else if (half) strack_detect_half(t, c, pic[c], TW - 4, TH, TW);
             else strack_detect_bc4(t, c, pic[c], 256);
         }
