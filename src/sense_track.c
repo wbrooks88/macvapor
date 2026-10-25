@@ -198,7 +198,8 @@ void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
 }
 
 void strack_default_params(strack_params *p) {
-    *p = (strack_params){.threshold = 170, .max_area = 600, .gate_px = 5, .min_leds = 5, .max_rms_px = 2.5f, .search_hz = 15, .calibrate = true};
+    *p = (strack_params){.threshold = 170, .max_area = 600, .gate_px = 5, .min_leds = 5, .max_rms_px = 2.5f, .search_hz = 15, .calibrate = true,
+                         .pred_max_sigma = 0, .pred_jump_m = 0.06f, .pred_veto_m = 0.15f};
 }
 
 // The camera's axes in the head: OpenCV's x right, y down, z forward, turned by yaw, pitch, roll.
@@ -430,6 +431,19 @@ int strack_detect_gray(strack *t, int cam, const uint8_t *pixels, int stride) {
 int strack_detect_half(strack *t, int cam, const uint8_t *pixels, int width, int height, int stride) {
     if (t->cam[cam].off) { t->nblobs[cam] = 0; return 0; }
     detect_gray(t, cam, pixels, width < FRAME_W ? width : FRAME_W, height < FRAME_H ? height : FRAME_H, stride, 2);
+    return t->nblobs[cam];
+}
+
+int strack_set_dots(strack *t, int cam, const strack_blob *dots, int n) {
+    t->nblobs[cam] = 0;
+    const strack_camera *c = &t->cam[cam];
+    if (c->off) return 0;
+    for (int i = 0; i < n; i++) {
+        strack_blob b = dots[i];
+        if (b.x < 0 || b.y < 0 || b.x >= c->width || b.y >= c->height) continue;
+        strack_unproject(c, b.x, b.y, b.ray);
+        add_blob(t, cam, &b);
+    }
     return t->nblobs[cam];
 }
 
@@ -1143,6 +1157,8 @@ typedef struct {
     float range;            // of the yaw search, radians either way
     float Rw[9], Rc[9];     // the prior as given, and as corrected by the tracker's yaw
     float dt;
+    bool from_pred;         // the fusion's prediction is sure enough to look there
+    float pred[3];
 } hand_job;
 
 static void accept(strack *t, const strack_input *in, int h, hand_job *j, const hpose *P, const match *m, int n,
@@ -1160,7 +1176,7 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     if (claim_around(t, P) >= 6 && n < 10) hs->tracking_poor = true;
     float R[9], p[3], D[9], e[3];
     world_from_head(in, P, R, p);
-    if (j->following && j->dt > 1e-3f) {
+    if (j->following && hs->tracking && j->dt > 1e-3f) {
         for (int k = 0; k < 3; k++) {
             float v = (p[k] - hs->p[k]) / j->dt;
             hs->v[k] = 0.5f * hs->v[k] + 0.5f * fmaxf(-8, fminf(8, v));
@@ -1224,7 +1240,12 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         mtm(Rh, j->Rc, j->pr.prior);
         mtv(Rh, upw, j->pr.up);
         j->dt = (in->time_ns - hs->t_ns) / 1e9f;
-        j->following = !poor && hs->tracking && j->dt > 0 && j->dt < 0.25f;
+        // Where the fusion has it, from its fits and its accelerometer since, is a better start
+        // than the last fit moved on at its speed; and while it's sure, a controller lost for a few
+        // frames is looked for there instead of searched for afresh.
+        j->from_pred = t->prm.pred_max_sigma > 0 && in->pred_valid[h] && in->pred_sigma[h] < t->prm.pred_max_sigma;
+        if (j->from_pred) memcpy(j->pred, in->pred_p[h], sizeof j->pred);
+        j->following = !poor && ((hs->tracking && j->dt > 0 && j->dt < 0.25f) || j->from_pred);
         if (!j->following) hs->tracking = false;
     }
 
@@ -1241,7 +1262,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         hpose P;
         match m[MAX_MATCHES];
         float p[3], rms = 1e9f;
-        for (int k = 0; k < 3; k++) p[k] = t->hs[h].p[k] + t->hs[h].v[k] * j->dt;
+        for (int k = 0; k < 3; k++) p[k] = j->from_pred ? j->pred[k] : t->hs[h].p[k] + t->hs[h].v[k] * j->dt;
         head_from_world(in, j->Rc, p, &P);
         hpose start = P;
         int n = polish(&j->pr, &P, t->prm.gate_px * 3, m, &rms);
@@ -1250,7 +1271,7 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         // A hand doesn't jump: a fit far from where it was going is on someone else's dots.
         float jump[3];
         for (int k = 0; k < 3; k++) jump[k] = P.p[k] - start.p[k];
-        if (norm3(jump) > 0.06f + 3 * j->dt || !reachable(&P)) continue;
+        if (norm3(jump) > (j->from_pred ? t->prm.pred_jump_m : 0.06f + 3 * j->dt) || !reachable(&P)) continue;
         accept(t, in, h, j, &P, m, n, rms, false, &out[h]);
     }
 
@@ -1292,6 +1313,13 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
             mtm(Rh, jobs[!h].Rc, Q.R);   // the other one, turned as its IMU says, here
             int nq = polish(&jobs[!h].pr, &Q, t->prm.gate_px * 3, mq, &rq);
             if (nq >= sn[h] && rq <= t->prm.max_rms_px * 1.5f) continue;
+        }
+        // Nowhere near where the fusion is sure it is: on someone else's dots.
+        if (jobs[h].from_pred && t->prm.pred_veto_m > 0) {
+            float R[9], p[3], d[3];
+            world_from_head(in, &sp[h], R, p);
+            for (int q = 0; q < 3; q++) d[q] = p[q] - jobs[h].pred[q];
+            if (norm3(d) > t->prm.pred_veto_m) continue;
         }
         // Not where the other one is.
         if (out[!h].valid) {
@@ -1523,5 +1551,14 @@ bool strack_fusion_predict(const strack_fusion *f, int64_t t_ns, int64_t max_age
         out[k] += o[k];
         if (vel) vel[k] += ov[k];
     }
+    return true;
+}
+
+bool strack_fusion_estimate(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float *sigma) {
+    if (!f->main.have || t_ns - f->last_ns > max_age_ns) return false;
+    track_predict(f, &f->main, t_ns, out, NULL);
+    strack_track c = f->main;
+    track_propagate(f, &c, t_ns);
+    *sigma = sqrtf((c.P[0][0][0] + c.P[1][0][0] + c.P[2][0][0]) / 3);
     return true;
 }

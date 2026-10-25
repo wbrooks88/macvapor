@@ -52,6 +52,11 @@ typedef struct {
     float max_rms_px;       // and how well, on average
     float search_hz;        // how often to search for a controller that isn't being followed
     bool calibrate;         // fit the cameras' turn, centre and focal length to what it sees
+    // With the fusion's prediction (strack_input's pred_p) sure to within pred_max_sigma (0: not
+    // used), a follow starts there and may move pred_jump_m from it, and a search's find further
+    // than pred_veto_m from it (0: any) is left out. Off: on the 80 s recording of fast moves
+    // (0.03, 0.06, 0.15) found the controllers in 2% more frames but was no closer once fused.
+    float pred_max_sigma, pred_jump_m, pred_veto_m;
 } strack_params;
 
 void strack_default_params(strack_params *out);
@@ -74,6 +79,9 @@ typedef struct {
     bool prior_valid[2];           // left, right: the controller is on and its IMU reports
     float prior_q[2][4];           // its LED model's orientation in the world, from its IMU; the
                                    // turn about the vertical may be off
+    bool pred_valid[2];            // where the fusion (strack_fusion) has the controller at this
+    float pred_p[2][3];            // exposure, from its fits and its accelerometer since, and how
+    float pred_sigma[2];           // sure it is (m)
 } strack_input;
 
 typedef struct {
@@ -106,6 +114,9 @@ int strack_detect_half(strack *t, int cam, const uint8_t *pixels, int width, int
 // count and 36-byte spots; see cpsvr2.h), the spots in the half-size picture's pixels. Spots go
 // through the same tests as dots found in a picture, bar the look at what's around them.
 int strack_detect_spots(strack *t, int cam, const uint8_t *block);
+// Dots found earlier (a capture's), in the full frame's pixels, brightest first: x, y, brightness
+// and area as strack_blobs() gave them. Replaces this camera's.
+int strack_set_dots(strack *t, int cam, const strack_blob *dots, int n);
 // No picture from this camera this frame.
 void strack_no_picture(strack *t, int cam);
 const strack_blob *strack_blobs(const strack *t, int cam, int *count);
@@ -183,6 +194,9 @@ bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int
 // The position and velocity at t_ns, carried on by the IMU's readings since the last fit; false if
 // no fit was taken in for max_age_ns.
 bool strack_fusion_predict(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]);
+// The filter's own estimate at t_ns, without the easing, and how sure it is (m, one deviation): for
+// the tracker to look there (strack_input's pred_p). False as strack_fusion_predict.
+bool strack_fusion_estimate(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float *sigma);
 
 #ifdef __cplusplus
 }

@@ -12,7 +12,11 @@
 // upper pair (and turns it on), UPOS the same for the upper pair, K1 the lenses' k1 and POS="x y z" the lower pair's position (the
 // left one's x is -x); THR sets the dot threshold, CAL turns calibration on, BLIND=c drops camera
 // c's picture, NOIMG skips the drawing. SPOTS=1 takes the dots from the headset's spot finder
-// (ld_NNN.bin beside each frame) instead of the pictures, where the capture has them.
+// (ld_NNN.bin beside each frame) instead of the pictures, where the capture has them. DOTS=1 takes
+// the dots the tracker found live, from frames.jsonl (a capture without pictures). With the
+// capture's imu.jsonl: IMU=1 takes each controller's orientation from its IMU at the exposure
+// (PRIOR_LAG ms after it, default 5) instead of the one the tracker was given live; FUSE=1 runs
+// strack_fusion alongside and gives the tracker its prediction (pred_p).
 
 #include "sense_track.h"
 
@@ -104,6 +108,74 @@ static void bc4(const unsigned char *b, unsigned char *px) {
     for (int i = 0; i < 16; i++) px[i] = p[(bits >> (3 * i)) & 7];
 }
 
+static void qmul(const float a[4], const float b[4], float o[4]) {
+    float r[4] = {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+                  a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+    memcpy(o, r, sizeof r);
+}
+
+// A capture's IMU readings, per hand, in order.
+typedef struct { long long t; float q[4], a[3]; } imu_rec;
+static imu_rec *g_imu[2];
+static int g_nimu[2];
+
+static void load_imu(const char *dir) {
+    char path[1024], l[512];
+    snprintf(path, sizeof path, "%s/imu.jsonl", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "no %s\n", path); return; }
+    int cap[2] = {0, 0};
+    while (fgets(l, sizeof l, f)) {
+        int h = strstr(l, "\"hand\": 1") ? 1 : 0;
+        const char *tp = strstr(l, "\"t\": ");
+        if (!tp) continue;
+        if (g_nimu[h] == cap[h]) g_imu[h] = realloc(g_imu[h], (cap[h] = cap[h] ? 2 * cap[h] : 4096) * sizeof(imu_rec));
+        imu_rec *r = &g_imu[h][g_nimu[h]++];
+        r->t = strtoll(tp + 5, NULL, 10);
+        float qa[4], aa[3];
+        sscanf(strstr(l, "\"q\": [") + 6, "%f, %f, %f, %f", &qa[0], &qa[1], &qa[2], &qa[3]);
+        sscanf(strstr(l, "\"a\": [") + 6, "%f, %f, %f", &aa[0], &aa[1], &aa[2]);
+        memcpy(r->q, qa, sizeof qa);
+        memcpy(r->a, aa, sizeof aa);
+    }
+    fclose(f);
+}
+
+// The IMU's orientation at t, between the readings either side.
+static bool imu_q_at(int h, long long t, float q[4]) {
+    int lo = 0, hi = g_nimu[h];
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_imu[h][m].t < t) lo = m + 1; else hi = m; }
+    if (lo == 0 || lo >= g_nimu[h]) return false;
+    const imu_rec *a = &g_imu[h][lo - 1], *b = &g_imu[h][lo];
+    if (b->t - a->t > 60000000) return false;
+    float w = (float)(t - a->t) / (float)(b->t - a->t), d = 0, n = 0;
+    for (int k = 0; k < 4; k++) d += a->q[k] * b->q[k];
+    for (int k = 0; k < 4; k++) { q[k] = a->q[k] + w * ((d < 0 ? -b->q[k] : b->q[k]) - a->q[k]); n += q[k] * q[k]; }
+    n = sqrtf(n);
+    for (int k = 0; k < 4; k++) q[k] /= n;
+    return true;
+}
+
+// The dots of one camera from a frames.jsonl line: "dots_<name>": [[x, y, area, brightness], ...].
+static int parse_dots(const char *line, const char *key, strack_blob *out, int max) {
+    const char *p = strstr(line, key);
+    if (!p || !(p = strchr(p, '['))) return 0;
+    p++;
+    int n = 0;
+    while (n < max) {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p != '[') break;
+        float x, y, b;
+        int a;
+        if (sscanf(p, "[%f, %f, %d, %f]", &x, &y, &a, &b) != 4) break;
+        out[n++] = (strack_blob){.x = x, .y = y, .area = a, .brightness = b};
+        p = strchr(p, ']');
+        if (!p) break;
+        p++;
+    }
+    return n;
+}
+
 static float jnum(const char *s, const char *key) {
     const char *p = strstr(s, key);
     return p ? strtof(strchr(p, ':') + 1, NULL) : 0;
@@ -179,6 +251,9 @@ int main(int argc, char **argv) {
     strack_params prm;
     strack_default_params(&prm);
     if (getenv("THR")) prm.threshold = atof(getenv("THR"));
+    if (getenv("PRED_SIGMA")) prm.pred_max_sigma = atof(getenv("PRED_SIGMA"));
+    if (getenv("PRED_JUMP")) prm.pred_jump_m = atof(getenv("PRED_JUMP"));
+    if (getenv("PRED_VETO")) prm.pred_veto_m = atof(getenv("PRED_VETO"));
     prm.calibrate = getenv("CAL") != NULL;   // off, as in the headset
     strack *t = strack_create(cams, &prm);
     snprintf(path, sizeof path, "%s/frames.jsonl", argv[1]);
@@ -188,6 +263,13 @@ int main(int argc, char **argv) {
     const char *bl = getenv("BLIND");
     int blind = bl ? atoi(bl) : -1, frame = 0;
     int use_spots = getenv("SPOTS") && atoi(getenv("SPOTS"));
+    int use_dots = getenv("DOTS") && atoi(getenv("DOTS")), use_imu = getenv("IMU") && atoi(getenv("IMU"));
+    int use_fuse = getenv("FUSE") && atoi(getenv("FUSE"));
+    float prior_lag_ms = getenv("PRIOR_LAG") ? atof(getenv("PRIOR_LAG")) : 5;
+    if (use_imu || use_fuse) load_imu(argv[1]);
+    static strack_fusion fz[2];
+    int fed[2] = {0, 0};
+    for (int h = 0; h < 2; h++) strack_fusion_init(&fz[h]);
     static unsigned char ld[36944];
     while (fgets(line, sizeof line, fl)) {
         char name[64];
@@ -200,11 +282,11 @@ int main(int argc, char **argv) {
         size_t got = fb ? fread(buf, 1, want, fb) : 0;
         if (fb) fclose(fb);
         if (got != want) {
-            if (!use_spots) continue;
+            if (!use_spots && !use_dots) continue;
             memset(buf, 0, want);   // a capture without the pictures
         }
         strack_input in = {0};
-        in.time_ns = (long long)jnum(line, "time_ns");
+        in.time_ns = strtoll(strstr(line, "\"time_ns\": ") + 11, NULL, 10);
         char *hd = strstr(line, "\"head\"");
         jarr(hd, "\"q\"", in.head.q, 4);
         jarr(hd, "\"p\"", in.head.p, 3);
@@ -219,6 +301,37 @@ int main(int argc, char **argv) {
             tmp[n] = 0;
             in.prior_valid[h] = strstr(tmp, "\"imu\": true") != NULL;
             if (in.prior_valid[h]) jarr(tmp, "prior_q", in.prior_q[h], 4);
+            float align[4] = {0, 0, 0, 1}, q[4];
+            // Live, each turn of the IMU's yaw (g_ctl_yaw, align_q here) was told to the tracker
+            // (strack_shift_yaw); the same turns, from one frame's align_q to the next.
+            static float last_yaw[2];
+            static bool have_yaw[2];
+            if (jarr(tmp, "align_q", align, 4)) {
+                float yaw = 2 * atan2f(align[1], align[3]);
+                if (have_yaw[h]) strack_shift_yaw(t, h, remainderf(yaw - last_yaw[h], 2 * (float)M_PI));
+                last_yaw[h] = yaw;
+                have_yaw[h] = true;
+            }
+            // The IMU's orientation at the exposure, turned to the LED model's as backend_psvr2.m does.
+            if (in.prior_valid[h] && use_imu && imu_q_at(h, in.time_ns + (long long)(prior_lag_ms * 1e6f), q)) {
+                static const float to_grip[4] = {0.42492f, 0, 0, 0.90523f};
+                float g[4];
+                qmul(align, q, g);
+                qmul(g, to_grip, in.prior_q[h]);
+            }
+            if (use_fuse) {
+                // The IMU's readings come in until the tracker gets this frame (about 25 ms after
+                // the exposure), less Bluetooth's couple of milliseconds.
+                while (fed[h] < g_nimu[h] && g_imu[h][fed[h]].t <= in.time_ns + 23000000) {
+                    const imu_rec *r = &g_imu[h][fed[h]++];
+                    float w[4], a[3];
+                    qmul(align, r->q, w);
+                    qrot(w, r->a, a);
+                    a[1] -= 9.80665f;
+                    strack_fusion_imu(&fz[h], r->t, a);
+                }
+                in.pred_valid[h] = strack_fusion_estimate(&fz[h], in.time_ns, 250000000, in.pred_p[h], &in.pred_sigma[h]);
+            }
         }
         bool spots = false;
         if (use_spots) {
@@ -240,7 +353,10 @@ int main(int argc, char **argv) {
                 have[c] = true;
                 pic[c] = buf + 256 + c * PB;
             }
+            static const char *dkey[] = {"\"dots_left\"", "\"dots_right\"", "\"dots_upper_left\"", "\"dots_upper_right\""};
+            strack_blob dots[STRACK_MAX_BLOBS];
             if (c == blind) strack_no_picture(t, c);
+            else if (use_dots) strack_set_dots(t, c, dots, parse_dots(line, dkey[c], dots, STRACK_MAX_BLOBS));
             else if (spots) strack_detect_spots(t, c, ld + 0x40 + c * 9220);
             else if (!have[c]) strack_no_picture(t, c);
             else if (half) strack_detect_half(t, c, pic[c], TW - 4, TH, TW);
@@ -248,6 +364,8 @@ int main(int argc, char **argv) {
         }
         strack_result r[2];
         strack_solve(t, &in, r);
+        for (int h = 0; h < 2 && use_fuse; h++)
+            if (r[h].valid) strack_fusion_optical(&fz[h], in.time_ns, r[h].pose.p, r[h].leds, r[h].rms_px);
         strack_camera cc[STRACK_CAMERAS];
         strack_get_cameras(t, cc);
         printf("%s", name);
