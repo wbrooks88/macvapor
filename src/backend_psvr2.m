@@ -538,9 +538,11 @@ static bool g_track_has[STRACK_CAMERAS];
 static double g_track_arrived;
 static bool g_track_pending, g_track_is_half;
 // The headset's spot finder (cpsvr2.h): its newest packet, for captures; and, while the cameras are
-// in the tracking mode, PSVR2XR_TRACK_SPOTS=1 takes the dots from it, 19 ms sooner than the
-// pictures come. It isn't the default: at 32 it runs LEDs close together into one spot, which
-// cost a controller seen from the side a third of its LEDs on the bench.
+// in the tracking mode, the dots from it, 19 ms sooner than the pictures come
+// (PSVR2XR_TRACK_SPOTS=0: from the pictures). At 32 it runs LEDs close together into one spot,
+// which cost a controller lying side-on half a metre away a third of its LEDs on the bench; but
+// on a recording of play its fits had as many LEDs as the pictures', and with the fusion the
+// sooner fits put the controllers 20 to 30% closer to where they were when shown.
 static unsigned char g_ld_packet[4][PSVR2_LD_PACKET_BYTES], g_track_ld[PSVR2_LD_PACKET_BYTES];   // the last 4
 static unsigned g_ld_count;
 static double g_stat_ld_ahead_s; static unsigned g_stat_ld_ahead_n;   // under g_track_lock
@@ -1065,7 +1067,7 @@ static void start_controller_tracking(void) {
     psvr2_camera_set_listener(camera_frame, NULL);
     psvr2_camera_set_tracking_listener(tracking_frame, NULL);
     const char *spots = getenv("PSVR2XR_TRACK_SPOTS");
-    g_use_spots = spots && atoi(spots);
+    g_use_spots = !spots || atoi(spots);
     psvr2_camera_set_led_detector_listener(led_detector_frame, NULL);
     if (psvr2_camera_start_tracking() != 0) {
         axr_log("controller tracking: the headset's cameras did not start; using the arm model");

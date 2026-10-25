@@ -1365,6 +1365,7 @@ void strack_fusion_init(strack_fusion *f) {
 
 void strack_fusion_reset(strack_fusion *f) {
     f->main.have = f->challenger.have = false;
+    f->nfix = 0;
     f->rejects = f->ch_n = 0;
     memset(f->off, 0, sizeof f->off);
     memset(f->off_v, 0, sizeof f->off_v);
@@ -1491,9 +1492,24 @@ static void ease_in(strack_fusion *f, int64_t ref, const float before[3], const 
     f->off_ns = ref;
 }
 
+static float fit_sigma(const strack_fusion *f, int leds, float rms_px) {
+    return (leds >= 13 ? 0.003f : leds >= 9 ? 0.004f : leds >= 6 ? 0.008f : 0.02f) * f->sigma_scale * fmaxf(1, rms_px / 2);
+}
+
+static void keep_fix(strack_fusion *f, int64_t t_ns, const float p[3], float sigma, const strack_track *before) {
+    if (f->nfix == 8) {
+        memmove(f->fix, f->fix + 1, 7 * sizeof f->fix[0]);
+        f->nfix = 7;
+    }
+    f->fix[f->nfix].t_ns = t_ns;
+    memcpy(f->fix[f->nfix].p, p, sizeof f->fix[0].p);
+    f->fix[f->nfix].sigma = sigma;
+    f->fix[f->nfix].before = *before;
+    f->nfix++;
+}
+
 bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int leds, float rms_px) {
-    float sigma = (leds >= 13 ? 0.003f : leds >= 9 ? 0.004f : leds >= 6 ? 0.008f : 0.02f) * f->sigma_scale *
-                  fmaxf(1, rms_px / 2);
+    float sigma = fit_sigma(f, leds, rms_px);
     if (f->main.have && t_ns - f->last_ns > 400000000) f->main.have = false;
     if (f->main.have && t_ns <= f->main.t_ns) return false;
     if (f->main.have && track_d2(f, &f->main, t_ns, p, sigma) <= f->gate * f->gate * 3) {
@@ -1503,6 +1519,7 @@ bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int
         if (ref < t_ns) ref = t_ns;
         float before[3], vb[3];
         track_predict(f, &f->main, ref, before, vb);
+        keep_fix(f, t_ns, p, sigma, &f->main);
         track_update(f, &f->main, t_ns, p, sigma);
         ease_in(f, ref, before, vb);
         f->last_ns = t_ns;
@@ -1531,6 +1548,7 @@ bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int
     if (f->ch_n >= need && (!f->main.have || f->rejects >= 3)) {
         f->main = *ch;
         ch->have = false;
+        f->nfix = 0;
         f->last_ns = t_ns;
         f->rejects = 0;
         memset(f->off, 0, sizeof f->off);
@@ -1540,6 +1558,40 @@ bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int
         return true;
     }
     return false;
+}
+
+bool strack_fusion_refine(strack_fusion *f, int64_t t_ns, const float p[3], int leds, float rms_px) {
+    if (!f->main.have || t_ns > f->main.t_ns) return strack_fusion_optical(f, t_ns, p, leds, rms_px);
+    unsigned i = 0;
+    while (i < f->nfix && f->fix[i].t_ns < t_ns) i++;
+    if (i == f->nfix) return false;   // older than all kept, or none kept
+    float sigma = fit_sigma(f, leds, rms_px);
+    strack_track tr = f->fix[i].before;
+    if (track_d2(f, &tr, t_ns, p, sigma) > f->gate * f->gate * 3) return false;
+    // The fits again from there, this one in its place.
+    unsigned n = 0, old = f->nfix;
+    struct { int64_t t_ns; float p[3], sigma; } later[8];
+    for (unsigned j = i + (f->fix[i].t_ns == t_ns); j < old; j++) {
+        later[n].t_ns = f->fix[j].t_ns;
+        memcpy(later[n].p, f->fix[j].p, sizeof later[n].p);
+        later[n++].sigma = f->fix[j].sigma;
+    }
+    int64_t ref = f->nimu ? f->imu[(f->nimu - 1) % STRACK_IMU_RING].t_ns : f->main.t_ns;
+    if (ref < f->main.t_ns) ref = f->main.t_ns;
+    float before[3], vb[3];
+    track_predict(f, &f->main, ref, before, vb);
+    f->nfix = i;
+    keep_fix(f, t_ns, p, sigma, &tr);
+    track_update(f, &tr, t_ns, p, sigma);
+    for (unsigned j = 0; j < n; j++) {
+        keep_fix(f, later[j].t_ns, later[j].p, later[j].sigma, &tr);
+        track_update(f, &tr, later[j].t_ns, later[j].p, later[j].sigma);
+    }
+    f->main = tr;
+    ease_in(f, ref, before, vb);
+    if (t_ns > f->last_ns) f->last_ns = t_ns;
+    f->refined++;
+    return true;
 }
 
 bool strack_fusion_predict(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]) {

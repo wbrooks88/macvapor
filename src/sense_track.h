@@ -176,11 +176,13 @@ typedef struct {
     struct { int64_t t_ns; float a[3]; } imu[STRACK_IMU_RING];
     unsigned nimu;
     strack_track main, challenger;
+    struct { int64_t t_ns; float p[3], sigma; strack_track before; } fix[8];   // the last fits taken in
+    unsigned nfix;
     int64_t last_ns;           // the last fit taken in
     int rejects, ch_n, ch_best;
     float off[3], off_v[3];    // the correction still being eased in, as of off_ns, and its rate
     int64_t off_ns;
-    unsigned accepted, rejected, restarts;   // counts, for the log
+    unsigned accepted, rejected, restarts, refined;   // counts, for the log
 } strack_fusion;
 
 void strack_fusion_init(strack_fusion *f);
@@ -191,6 +193,10 @@ void strack_fusion_imu(strack_fusion *f, int64_t t_ns, const float accel[3]);
 // A fit: the exposure time, the LED model's position in the world, how many LEDs and how well.
 // Returns whether it was taken in.
 bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int leds, float rms_px);
+// A better fit for an exposure already gone by (the pictures' fit, after the spot finder's): it
+// takes the place of the fit taken in for that exposure, or goes in among the later ones, and those
+// are taken in again after it. False if it's too old (more than 8 fits back) or far from the rest.
+bool strack_fusion_refine(strack_fusion *f, int64_t t_ns, const float p[3], int leds, float rms_px);
 // The position and velocity at t_ns, carried on by the IMU's readings since the last fit; false if
 // no fit was taken in for max_age_ns.
 bool strack_fusion_predict(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]);
