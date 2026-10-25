@@ -70,4 +70,6 @@ bool sense_leds_on(int hand);
 // The headset's camera exposures (one's centre on CLOCK_MONOTONIC in ns, and the period): the
 // tracking LEDs then flash once on each, shift_ns after it (the unknown latencies, found by trying).
 // A period of 0 goes back to steady pulses.
-void sense_led_timing(int64_t exposure_ns, int64_t period_ns, int64_t shift_ns);       // the last output report to that controller asked for them on
+void sense_led_timing(int64_t exposure_ns, int64_t period_ns, int64_t shift_ns);
+// The LED settings under test (PSVR2XR_LED_TEST), for captures: false if none.
+bool sense_led_test(unsigned *phase, unsigned *period, unsigned *blink);       // the last output report to that controller asked for them on

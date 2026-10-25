@@ -113,6 +113,18 @@ static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >>
 
 // ----------------------------------------------------------------------------------- calibration
 
+// PSVR2XR_SENSE_POLLING=n sends Monado's request for "the lower 133 Hz polling rate" (feature
+// report 0x08, pssense_set_pc_polling_rate; n its first rate, 12 there). Over Bluetooth the reports
+// came every 15 ms with it or without it, for 12, 6 or 3, so it isn't sent otherwise.
+static void set_polling_rate(controller *c) {
+    const char *e = getenv("PSVR2XR_SENSE_POLLING");
+    if (!e || !atoi(e)) return;
+    uint8_t r[48] = {0x08, 0x0E, e ? (uint8_t)atoi(e) : 0x0C, 0x00, 0x02, 0x00};
+    put32(r + 44, crc32_seeded(0x53, r, 44));
+    IOReturn res = IOHIDDeviceSetReport(c->dev, kIOHIDReportTypeFeature, r[0], r, sizeof r);
+    if (res != kIOReturnSuccess) axr_log("sense: setting the polling rate failed (0x%x)", res);
+}
+
 static bool read_calibration(controller *c) {
     uint8_t blob[CALIB_LEN] = {0};
     bool have[2] = {false, false};
@@ -343,6 +355,16 @@ static uint32_t device_ticks_at(const controller *c, int64_t t) {
     return (uint32_t)((t + off) * 3 / 1000);
 }
 
+static unsigned test_phase, test_period, test_blink;
+static bool test_on;
+
+bool sense_led_test(unsigned *phase, unsigned *period, unsigned *blink) {
+    *phase = test_phase;
+    *period = test_period;
+    *blink = test_blink;
+    return test_on;
+}
+
 static void fill_settings(controller *c, uint8_t *s, int64_t t) {
     if (c->vib_amplitude && t >= c->vib_end_ns) { c->vib_amplitude = 0; c->vib_dirty = true; }
     if (c->vib_dirty) {
@@ -387,6 +409,25 @@ static void fill_settings(controller *c, uint8_t *s, int64_t t) {
         if (on) c->led_start = c->device_ticks + (uint32_t)((t - c->device_ticks_ns) * 3 / 1000) + LED_LEAD_TICKS;
     }
     s[19] = on ? LED_PRESCAN : LED_ALL_OFF;
+    // PSVR2XR_LED_TEST names a file holding "phase period_id blink" (blink 8 hex digits, the four
+    // bytes Monado's struct pssense_led_settings calls led_blink), for working out what they do;
+    // read again when it changes.
+    static const char *test = (const char *)-1;
+    static int64_t test_checked;
+    static unsigned test_gen, sent_gen[2];
+    if (test == (const char *)-1) test = getenv("PSVR2XR_LED_TEST");
+    if (test && t - test_checked > 200000000) {
+        test_checked = t;
+        FILE *f = fopen(test, "r");
+        unsigned ph, pe, bl;
+        if (f && fscanf(f, "%u %u %x", &ph, &pe, &bl) == 3 && (!test_on || ph != test_phase || pe != test_period || bl != test_blink)) {
+            test_phase = ph; test_period = pe; test_blink = bl; test_on = true; test_gen++;
+            axr_log("sense: LED test: phase %u, period %u, blink %08x", ph, pe, bl);
+        }
+        if (f) fclose(f);
+    }
+    int hi = c == &g_ctl[SENSE_RIGHT];
+    if (on && test_on && sent_gen[hi] != test_gen) { sent_gen[hi] = test_gen; c->led_seq++; }
     s[20] = c->led_seq;
     if (on && sync) {
         s[21] = LED_STEADY_PERIOD;
@@ -398,6 +439,11 @@ static void fill_settings(controller *c, uint8_t *s, int64_t t) {
         put32(s + 22, c->led_start);
         put32(s + 26, LED_STEADY_CYCLE);
         memset(s + 30, 0xff, 4);                // every LED of the four groups
+    }
+    if (on && test_on) {
+        s[19] = (uint8_t)test_phase;
+        if (test_period) s[21] = (uint8_t)test_period;
+        put32(s + 30, test_blink);
     }
 }
 
@@ -487,6 +533,7 @@ static void matched(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef dev
     pthread_mutex_lock(&g_lock);
     *c = fresh;
     pthread_mutex_unlock(&g_lock);
+    set_polling_rate(c);
     bool calibrated = read_calibration(c);   // also switches it into full mode
     pthread_mutex_lock(&g_lock);
     c->calibrated = calibrated;

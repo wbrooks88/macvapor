@@ -126,6 +126,8 @@ const strack_blob *strack_blobs(const strack *t, int cam, int *count);
 
 // The controllers' poses from the dots found in this frame's cameras.
 void strack_solve(strack *t, const strack_input *in, strack_result out[2]);
+// The last fit of a hand's matches: camera, LED and dot (strack_blobs' index), up to max.
+int strack_last_matches(const strack *t, int hand, int (*out)[3], int max);
 
 // The cameras as calibrated so far (or as given, until the first calibration), to save and start
 // from next time; and how many calibrations have been taken in, with the last one's fit in pixels.

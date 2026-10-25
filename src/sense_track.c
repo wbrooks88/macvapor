@@ -267,6 +267,8 @@ typedef struct {
     bool tracking_poor;         // the last fit left many of its dots unexplained
     bool unexplained_check;     // this frame's fit is to be checked for that
     hpose check_P;
+    match last_m[MAX_MATCHES];  // the last fit's matches
+    int last_n;
 } hand_state;
 
 enum { CAL_SAMPLES = 40 };
@@ -1199,6 +1201,8 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
         t->claimed[m[i].cam][m[i].blob] = true;
         t->fitted[m[i].cam][m[i].blob] = (signed char)h;
     }
+    memcpy(hs->last_m, m, n * sizeof *m);
+    hs->last_n = n;
     claim_around(t, P);
     hs->unexplained_check = n < 10;   // counted once both hands are in (strack_solve's end)
     hs->check_P = *P;
@@ -1703,4 +1707,15 @@ bool strack_fusion_estimate(const strack_fusion *f, int64_t t_ns, int64_t max_ag
     track_propagate(f, &c, t_ns);
     *sigma = sqrtf((c.P[0][0][0] + c.P[1][0][0] + c.P[2][0][0]) / 3);
     return true;
+}
+
+int strack_last_matches(const strack *t, int hand, int (*out)[3], int max) {
+    const hand_state *hs = &t->hs[hand];
+    int n = hs->last_n < max ? hs->last_n : max;
+    for (int i = 0; i < n; i++) {
+        out[i][0] = hs->last_m[i].cam;
+        out[i][1] = hs->last_m[i].led;
+        out[i][2] = hs->last_m[i].blob;
+    }
+    return n;
 }

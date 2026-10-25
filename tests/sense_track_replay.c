@@ -428,6 +428,15 @@ int main(int argc, char **argv) {
             printf(" | %s head(%.4f %.4f %.4f) leds %d rms %.2f yaw %.0f%s world(%.4f %.4f %.4f) t %lld exp %d", h ? "R" : "L", ph[0],
                    ph[1], ph[2], r[h].leds, r[h].rms_px, r[h].yaw_error * 57.3f, r[h].found ? " found" : "", r[h].pose.p[0],
                    r[h].pose.p[1], r[h].pose.p[2], (long long)in.time_ns, r[h].expected);
+            if (getenv("MATCHES")) {
+                int mm[64][3], nm = strack_last_matches(t, h, mm, 64);
+                printf(" M");
+                for (int i = 0; i < nm; i++) {
+                    int nb;
+                    const strack_blob *bb = strack_blobs(t, mm[i][0], &nb);
+                    if (mm[i][2] < nb) printf(" %d:%d:%.1f:%.1f", mm[i][0], mm[i][1], bb[mm[i][2]].x, bb[mm[i][2]].y);
+                }
+            }
             printf(" tilt %.1f %.1f q %.5f %.5f %.5f %.5f prior %.5f %.5f %.5f %.5f", r[h].tilt_error[0] * 57.3f,
                    r[h].tilt_error[1] * 57.3f, r[h].pose.q[0], r[h].pose.q[1], r[h].pose.q[2], r[h].pose.q[3], in.prior_q[h][0],
                    in.prior_q[h][1], in.prior_q[h][2], in.prior_q[h][3]);

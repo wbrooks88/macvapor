@@ -804,7 +804,10 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
         FILE *lf = fopen([g_capture_dir stringByAppendingPathComponent:ld_name].fileSystemRepresentation, "wb");
         if (lf) { fwrite(ld_copy, 1, sizeof ld_copy, lf); fclose(lf); }
     }
-    fprintf(g_capture, "{\"file\": \"%s\", \"time_ns\": %lld, \"head\": {\"q\": [%.6f, %.6f, %.6f, %.6f], \"p\": [%.4f, %.4f, %.4f]}",
+    unsigned lph, lpe, lbl;
+    if (sense_led_test(&lph, &lpe, &lbl)) fprintf(g_capture, "{\"led_test\": [%u, %u, %u], ", lph, lpe, lbl);
+    else fprintf(g_capture, "{");
+    fprintf(g_capture, "\"file\": \"%s\", \"time_ns\": %lld, \"head\": {\"q\": [%.6f, %.6f, %.6f, %.6f], \"p\": [%.4f, %.4f, %.4f]}",
             name.UTF8String, (long long)in->time_ns, in->head.q[0], in->head.q[1], in->head.q[2], in->head.q[3],
             in->head.p[0], in->head.p[1], in->head.p[2]);
     for (int h = 0; h < 2; h++) {
