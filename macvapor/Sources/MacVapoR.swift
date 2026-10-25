@@ -113,6 +113,7 @@ enum PSVR2 {
         var foveatedInsetScale = 1.0
         var controllerLatencyMs = 25.0
         var controllerThreshold = 170.0
+        var controllerSmoothing = 1.0
 
         static func load() -> Settings {
             var s = Settings()
@@ -128,6 +129,7 @@ enum PSVR2 {
             s.controllerTracking = c["controller_tracking"] as? Bool ?? s.controllerTracking
             s.controllerLatencyMs = c["controller_latency_ms"] as? Double ?? s.controllerLatencyMs
             s.controllerThreshold = c["controller_threshold"] as? Double ?? s.controllerThreshold
+            s.controllerSmoothing = c["controller_smoothing"] as? Double ?? s.controllerSmoothing
             s.eyeTracking = c["eye_tracking"] as? Bool ?? s.eyeTracking
             s.showGaze = c["show_gaze"] as? Bool ?? s.showGaze
             s.foveated = c["foveated"] as? Bool ?? s.foveated
@@ -144,7 +146,7 @@ enum PSVR2 {
                                     "foveated": foveated, "foveated_area_deg": foveatedAreaDeg,
                                     "foveated_outer_scale": foveatedOuterScale, "foveated_inset_scale": foveatedInsetScale,
                                     "controller_tracking": controllerTracking, "controller_latency_ms": controllerLatencyMs,
-                                    "controller_threshold": controllerThreshold]
+                                    "controller_threshold": controllerThreshold, "controller_smoothing": controllerSmoothing]
             try? FileManager.default.createDirectory(at: Paths.psvr2Config.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let out = try? JSONSerialization.data(withJSONObject: c, options: [.prettyPrinted, .sortedKeys]) {
                 try? out.write(to: Paths.psvr2Config, options: .atomic)
@@ -964,6 +966,14 @@ struct ContentView: View {
                 Toggle("Sense controllers", isOn: $model.psvr2Settings.controllers)
                 Toggle("Track controller position with the headset cameras", isOn: $model.psvr2Settings.controllerTracking)
                     .disabled(!model.psvr2Settings.controllers)
+                HStack {
+                    Text("Controller smoothing")
+                    Slider(value: $model.psvr2Settings.controllerSmoothing, in: 0...3, step: 0.25).frame(maxWidth: 260)
+                    Text(model.psvr2Settings.controllerSmoothing == 0 ? "off" : String(format: "%.2f", model.psvr2Settings.controllerSmoothing))
+                        .monospacedDigit()
+                    Text("higher: steadier when still, a little more lag").font(.caption).foregroundStyle(.secondary)
+                }
+                .disabled(!model.psvr2Settings.controllerTracking)
                 Toggle("Eye tracking", isOn: $model.psvr2Settings.eyeTracking)
                 Toggle("Show where I look (a yellow ring)", isOn: $model.psvr2Settings.showGaze)
                 Toggle("Foveated rendering, in games that support it (quad views)", isOn: $model.psvr2Settings.foveated)

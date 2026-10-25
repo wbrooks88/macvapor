@@ -138,9 +138,18 @@ typedef struct {
     int64_t t_ns;           // of the state
     float p[3], v[3];
     int64_t last_seen_ns;
+    // A one-euro filter ahead of it (Casiez et al.): the position smoothed hard while the hand is
+    // still and hardly at all while it moves fast, so fit jitter of a few millimetres goes and
+    // swings keep up. min_hz 0 turns it off.
+    float min_hz, beta;     // cutoff at rest, and how much it rises per m/s
+    bool e_have;
+    int64_t e_t_ns;
+    float e_p[3], e_dp[3];
 } strack_filter;
 
 void strack_filter_update(strack_filter *f, const float p[3], int64_t t_ns);
+// The one-euro filter's settings: a cutoff of 1.5 Hz at rest, rising 8 Hz per m/s.
+void strack_filter_init(strack_filter *f);
 // The position at t_ns; false if it hasn't been seen for max_age_ns.
 bool strack_filter_predict(const strack_filter *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]);
 

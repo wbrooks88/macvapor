@@ -95,6 +95,7 @@ typedef struct {
     bool controller_tracking;      // their position from the headset's cameras
     float controller_latency_ms;   // from a camera frame's exposure to its arrival over USB
     float controller_threshold;    // 0..255: how bright an LED's dot is in the camera picture
+    float controller_smoothing;    // 0 off, 1 as tuned, more to smooth harder (its jitter vs its lag)
     bool eye_tracking;    // the headset's eye tracker
     bool show_gaze;       // a ring where the eyes look, to check the eye tracker
     bool foveated;        // offer quad views (a gaze-following sharp inset) to games that use them
@@ -106,7 +107,7 @@ typedef struct {
 static NSString *g_config_dir;
 static config g_cfg = {.render_scale = 0.75f, .eye_height = 1.6f, .chromatic = true, .reprojection = true,
                        .controllers = true, .controller_tracking = true, .controller_latency_ms = 25,
-                       .controller_threshold = 170, .eye_tracking = true, .foveated = true, .foveated_area_deg = 40,
+                       .controller_threshold = 170, .controller_smoothing = 1, .eye_tracking = true, .foveated = true, .foveated_area_deg = 40,
                        .foveated_outer_scale = 0.5f, .foveated_inset_scale = 1.0f};
 
 static void read_config(void) {
@@ -122,6 +123,7 @@ static void read_config(void) {
             @"controller_tracking" : @(g_cfg.controller_tracking),
             @"controller_latency_ms" : @(g_cfg.controller_latency_ms),
             @"controller_threshold" : @(g_cfg.controller_threshold),
+            @"controller_smoothing" : @(g_cfg.controller_smoothing),
             @"show_gaze" : @(g_cfg.show_gaze), @"foveated" : @(g_cfg.foveated),
             @"foveated_area_deg" : @(g_cfg.foveated_area_deg), @"foveated_outer_scale" : @(g_cfg.foveated_outer_scale),
             @"foveated_inset_scale" : @(g_cfg.foveated_inset_scale),
@@ -144,6 +146,8 @@ static void read_config(void) {
         g_cfg.controller_latency_ms = fmaxf(0, fminf(100, [c[@"controller_latency_ms"] floatValue]));
     if (c[@"controller_threshold"])
         g_cfg.controller_threshold = fmaxf(40, fminf(254, [c[@"controller_threshold"] floatValue]));
+    if (c[@"controller_smoothing"])
+        g_cfg.controller_smoothing = fmaxf(0, fminf(4, [c[@"controller_smoothing"] floatValue]));
     if (c[@"eye_tracking"]) g_cfg.eye_tracking = [c[@"eye_tracking"] boolValue];
     if (c[@"show_gaze"]) g_cfg.show_gaze = [c[@"show_gaze"] boolValue];
     if (c[@"foveated"]) g_cfg.foveated = [c[@"foveated"] boolValue];
@@ -399,6 +403,7 @@ static void recenter(void) {
             pthread_mutex_lock(&g_lock);
             g_ctl_yaw[h] = qnorm(qmul(turn, g_ctl_yaw[h]));
             g_optical[h].have = false;
+            g_optical[h].e_have = false;
             pthread_mutex_unlock(&g_lock);
         } else {
             align_controller(h, 0);
@@ -896,6 +901,12 @@ static void *tracking_thread(void *arg) {
 }
 
 static void start_controller_tracking(void) {
+    for (int h = 0; h < 2; h++) {
+        strack_filter_init(&g_optical[h]);
+        float s = g_cfg.controller_smoothing;
+        g_optical[h].min_hz = s > 0 ? g_optical[h].min_hz / s : 0;
+        g_optical[h].beta = s > 0 ? g_optical[h].beta / s : 0;
+    }
     strack_camera cams[STRACK_CAMERAS];
     load_cameras(cams);
     strack_params prm;

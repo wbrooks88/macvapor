@@ -1284,7 +1284,43 @@ void strack_shift_yaw(strack *t, int hand, float angle) {
 
 // ------------------------------------------------------------------------------------ smoothing
 
-void strack_filter_update(strack_filter *f, const float p[3], int64_t t_ns) {
+void strack_filter_init(strack_filter *f) {
+    memset(f, 0, sizeof *f);
+    f->min_hz = 1.5f;
+    f->beta = 8;
+}
+
+static float euro_alpha(float hz, float dt) {
+    float tau = 1 / (2 * PI_F * hz);
+    return 1 / (1 + tau / dt);
+}
+
+// The one-euro filter: its speed from the change in the raw position, smoothed at 2 Hz; then the
+// position smoothed with a cutoff that rises with that speed. Starts afresh after a gap.
+static void euro(strack_filter *f, const float in[3], int64_t t_ns, float out[3]) {
+    float dt = (t_ns - f->e_t_ns) / 1e9f;
+    if (f->min_hz <= 0 || !f->e_have || dt <= 0 || dt > 0.3f) {
+        memcpy(f->e_p, in, sizeof f->e_p);
+        memset(f->e_dp, 0, sizeof f->e_dp);
+        f->e_have = true;
+        f->e_t_ns = t_ns;
+        memcpy(out, in, 3 * sizeof *out);
+        return;
+    }
+    float ad = euro_alpha(2, dt), speed = 0;
+    for (int k = 0; k < 3; k++) {
+        f->e_dp[k] += ad * ((in[k] - f->e_p[k]) / dt - f->e_dp[k]);
+        speed += f->e_dp[k] * f->e_dp[k];
+    }
+    float a = euro_alpha(f->min_hz + f->beta * sqrtf(speed), dt);
+    for (int k = 0; k < 3; k++) f->e_p[k] += a * (in[k] - f->e_p[k]);
+    f->e_t_ns = t_ns;
+    memcpy(out, f->e_p, sizeof f->e_p);
+}
+
+void strack_filter_update(strack_filter *f, const float p_in[3], int64_t t_ns) {
+    float p[3];
+    euro(f, p_in, t_ns, p);
     float dt = (t_ns - f->t_ns) / 1e9f;
     if (!f->have || dt <= 0 || dt > 0.3f || t_ns - f->last_seen_ns > 300000000) {
         memcpy(f->p, p, sizeof f->p);
