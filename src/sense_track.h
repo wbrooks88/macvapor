@@ -170,8 +170,18 @@ typedef struct {
     float bias_walk;           // m/s2 per root second
     float sigma_scale;         // on a fit's error by its LEDs (3 mm on 13 or more, to 2 cm on 3 to 5)
     float gate;                // a fit further than this many deviations from the prediction is left out
+    float gate_sigma;          // m: the most a fit's own error counts for in that (0: as weighted)
+    float start_v_sigma;       // m/s: a track starting less sure of its velocity than this starts still
+    float max_speed;           // m/s
     float blend_s;             // how long a correction takes to ease in; 0 shows it at once
     float imu_lag_s;           // the IMU's readings are this much later than they say against the cameras
+    float coast_after_s;       // with no fit for this long it coasts: the accelerometer counted at
+    float coast_accel;         // this much, the velocity fading over coast_tau_s, and where it is
+    float coast_tau_s;         // growing unsure by coast_noise m per root second
+    float coast_noise;
+    int restart_fits;          // fits agreeing with each other, and not with the filter, to restart it
+    int restart_misses;        // after the filter has left out this many in a row
+    int restart_leds;          // and one of them on at least this many LEDs
     // State.
     struct { int64_t t_ns; float a[3]; } imu[STRACK_IMU_RING];
     unsigned nimu;

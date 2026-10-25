@@ -269,7 +269,12 @@ int main(int argc, char **argv) {
     if (use_imu || use_fuse) load_imu(argv[1]);
     static strack_fusion fz[2];
     int fed[2] = {0, 0};
-    for (int h = 0; h < 2; h++) strack_fusion_init(&fz[h]);
+    for (int h = 0; h < 2; h++) {
+        strack_fusion_init(&fz[h]);
+        if (getenv("RFITS")) fz[h].restart_fits = atoi(getenv("RFITS"));
+        if (getenv("RMISSES")) fz[h].restart_misses = atoi(getenv("RMISSES"));
+        if (getenv("RLEDS")) fz[h].restart_leds = atoi(getenv("RLEDS"));
+    }
     static unsigned char ld[36944];
     while (fgets(line, sizeof line, fl)) {
         char name[64];

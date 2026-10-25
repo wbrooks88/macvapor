@@ -1361,6 +1361,16 @@ void strack_fusion_init(strack_fusion *f) {
     // Cross-correlating the fits' acceleration with the accelerometer's put its readings 5 ms
     // later than the exposure times the cameras' were given.
     f->imu_lag_s = 0.005f;
+    f->gate_sigma = 0.01f;
+    f->start_v_sigma = 0.5f;
+    f->max_speed = 5;
+    f->coast_after_s = 0.05f;
+    f->coast_tau_s = 0.15f;
+    f->coast_accel = 0.3f;
+    f->coast_noise = 0.2f;
+    f->restart_fits = 3;
+    f->restart_misses = 3;
+    f->restart_leds = 0;
 }
 
 void strack_fusion_reset(strack_fusion *f) {
@@ -1380,19 +1390,28 @@ void strack_fusion_imu(strack_fusion *f, int64_t t_ns, const float accel[3]) {
     f->nimu++;
 }
 
-static void track_step(const strack_fusion *f, strack_track *tr, const float a[3], float dt) {
-    float q = f->accel_noise * f->accel_noise, dt2 = dt * dt;
+// One step of dt on the acceleration a. Coasting (no fit for a while), the accelerometer counts for
+// less, the velocity fades and the filter grows less sure, so it doesn't fly off on a velocity or
+// a tilt it got wrong (pointing up, the IMU's tilt drifts tens of degrees, and gravity leaks into
+// its acceleration), and the next fit is taken in where the controller really is.
+static void track_step(const strack_fusion *f, strack_track *tr, const float a[3], float dt, bool coasting) {
+    float q = f->accel_noise * f->accel_noise, dt2 = dt * dt, d = 1, ka = 1, wander = 0;
+    if (coasting) {
+        wander = f->coast_noise * f->coast_noise * dt;   // where it is grows unsure, not its velocity
+        d = expf(-dt / f->coast_tau_s);
+        ka = f->coast_accel;
+    }
     for (int k = 0; k < 3; k++) {
-        float *x = tr->x[k], u = a[k] - x[2];
+        float *x = tr->x[k], u = ka * (a[k] - x[2]);
         x[0] += x[1] * dt + 0.5f * u * dt2;
-        x[1] += u * dt;
-        // P = F P F' + Q, F = [1 dt -dt^2/2; 0 1 -dt; 0 0 1]
-        float F[3][3] = {{1, dt, -0.5f * dt2}, {0, 1, -dt}, {0, 0, 1}}, FP[3][3], (*P)[3] = tr->P[k];
+        x[1] = fmaxf(-f->max_speed, fminf(f->max_speed, d * (x[1] + u * dt)));
+        // P = F P F' + Q, F = [1 dt -ka dt^2/2; 0 d -d ka dt; 0 0 1]
+        float F[3][3] = {{1, dt, -0.5f * ka * dt2}, {0, d, -d * ka * dt}, {0, 0, 1}}, FP[3][3], (*P)[3] = tr->P[k];
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 3; j++) FP[i][j] = F[i][0] * P[0][j] + F[i][1] * P[1][j] + F[i][2] * P[2][j];
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 3; j++) P[i][j] = FP[i][0] * F[j][0] + FP[i][1] * F[j][1] + FP[i][2] * F[j][2];
-        P[0][0] += q * dt2 * dt / 3;
+        P[0][0] += q * dt2 * dt / 3 + wander;
         P[0][1] += q * dt2 / 2;
         P[1][0] += q * dt2 / 2;
         P[1][1] += q * dt;
@@ -1409,11 +1428,13 @@ static void track_propagate(const strack_fusion *f, strack_track *tr, int64_t t_
     while (i > first && f->imu[(i - 1) % STRACK_IMU_RING].t_ns > tr->t_ns) i--;
     static const float none[3] = {0, 0, 0};
     const float *a = i > first ? f->imu[(i - 1) % STRACK_IMU_RING].a : none;
-    int64_t t = tr->t_ns;
+    // The state is as of its last fit; past coast_after_s from it, it coasts.
+    int64_t t = tr->t_ns, coast = tr->t_ns + (int64_t)(f->coast_after_s * 1e9f);
     while (t < t_ns) {
         int64_t next = i < f->nimu ? f->imu[i % STRACK_IMU_RING].t_ns : t_ns;
         if (next > t_ns) next = t_ns;
-        if (next > t) track_step(f, tr, a, (next - t) / 1e9f);
+        if (t < coast && next > coast) next = coast;
+        if (next > t) track_step(f, tr, a, (next - t) / 1e9f, t >= coast);
         t = next;
         if (i < f->nimu && f->imu[i % STRACK_IMU_RING].t_ns <= t) a = f->imu[i++ % STRACK_IMU_RING].a;
     }
@@ -1433,8 +1454,11 @@ static void track_start(strack_track *tr, int64_t t_ns, const float p[3], float 
     }
 }
 
-// The squared distance of p from where the track has it at t_ns, in deviations.
+// The squared distance of p from where the track has it at t_ns, in deviations. A fit on few LEDs
+// is weighted as rough, but it isn't let in as far: such a fit is either within a centimetre or two
+// or on the wrong dots altogether, so the gate takes its error as at most gate_sigma.
 static float track_d2(const strack_fusion *f, const strack_track *tr, int64_t t_ns, const float p[3], float sigma) {
+    if (f->gate_sigma > 0 && sigma > f->gate_sigma) sigma = f->gate_sigma;
     strack_track c = *tr;
     track_propagate(f, &c, t_ns);
     float d2 = 0;
@@ -1544,8 +1568,17 @@ bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int
         f->ch_n = 1;
         f->ch_best = leds;
     }
-    int need = f->ch_best >= 10 ? 2 : 3;
-    if (f->ch_n >= need && (!f->main.have || f->rejects >= 3)) {
+    int need = f->main.have ? f->restart_fits : f->ch_best >= 10 ? 2 : 3;
+    bool strong = !f->main.have || f->ch_best >= f->restart_leds;
+    if (f->ch_n >= need && strong && (!f->main.have || f->rejects >= f->restart_misses)) {
+        // Two or three fits a frame apart, on few LEDs, give the velocity only to a few metres a
+        // second: started on that, it flew off between fits. Unsure, it starts from still.
+        for (int k = 0; k < 3; k++)
+            if (ch->P[k][1][1] > f->start_v_sigma * f->start_v_sigma) {
+                ch->x[k][1] = 0;
+                ch->P[k][1][1] = f->start_v_sigma * f->start_v_sigma;
+                ch->P[k][0][1] = ch->P[k][1][0] = ch->P[k][1][2] = ch->P[k][2][1] = 0;
+            }
         f->main = *ch;
         ch->have = false;
         f->nfix = 0;
