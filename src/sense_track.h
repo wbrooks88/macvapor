@@ -133,29 +133,56 @@ void strack_unproject(const strack_camera *c, float u, float v, float ray[3]);
 // The LED model: left (0) or right (1), LED i, position (m) and facing (unit).
 void strack_led(int hand, int i, float pos[3], float normal[3]);
 
-// --------------------------------------------------------------------------- smoothing
+// --------------------------------------------------------------------------- fusion
+//
+// Each controller's position from its fits and its own accelerometer: a Kalman filter on position,
+// velocity and the accelerometer's bias (each axis on its own), driven between fits by the IMU's
+// acceleration in the world and corrected by each fit at its exposure time, however late that
+// arrives. A fit far from where the IMU says the controller went is left out (the tracker's few-LED
+// fits are now and then on the wrong dots, tens of centimetres off); if the fits keep agreeing with
+// each other and not with it, the filter starts again from them. Each correction is eased in over
+// blend_s, so the position doesn't step at the cameras' 60 Hz. On a recording of fast moves this
+// was 2 to 3 times closer to the best fits than the smoothing before it, at a tenth of the wobble.
 
-// The optical positions in, smoothed and carried forward to the time a frame is shown: an
-// alpha-beta filter on the position, its velocity damped while it isn't seen.
+enum { STRACK_IMU_RING = 256 };
+
 typedef struct {
     bool have;
-    int64_t t_ns;           // of the state
-    float p[3], v[3];
-    int64_t last_seen_ns;
-    // A one-euro filter ahead of it (Casiez et al.): the position smoothed hard while the hand is
-    // still and hardly at all while it moves fast, so fit jitter of a few millimetres goes and
-    // swings keep up. min_hz 0 turns it off.
-    float min_hz, beta;     // cutoff at rest, and how much it rises per m/s
-    bool e_have;
-    int64_t e_t_ns;
-    float e_p[3], e_dp[3];
-} strack_filter;
+    int64_t t_ns;              // of the state
+    float x[3][3];             // per axis: position (m), velocity (m/s), accelerometer bias (m/s2)
+    float P[3][3][3];          // and its covariance
+} strack_track;
 
-void strack_filter_update(strack_filter *f, const float p[3], int64_t t_ns);
-// The one-euro filter's settings: a cutoff of 1.5 Hz at rest, rising 8 Hz per m/s.
-void strack_filter_init(strack_filter *f);
-// The position at t_ns; false if it hasn't been seen for max_age_ns.
-bool strack_filter_predict(const strack_filter *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]);
+typedef struct {
+    // Settings (strack_fusion_init's are the ones tuned on the recording).
+    float accel_noise;         // m/s2: how far the accelerometer is trusted
+    float bias_walk;           // m/s2 per root second
+    float sigma_scale;         // on a fit's error by its LEDs (3 mm on 13 or more, to 2 cm on 3 to 5)
+    float gate;                // a fit further than this many deviations from the prediction is left out
+    float blend_s;             // how long a correction takes to ease in; 0 shows it at once
+    float imu_lag_s;           // the IMU's readings are this much later than they say against the cameras
+    // State.
+    struct { int64_t t_ns; float a[3]; } imu[STRACK_IMU_RING];
+    unsigned nimu;
+    strack_track main, challenger;
+    int64_t last_ns;           // the last fit taken in
+    int rejects, ch_n, ch_best;
+    float off[3], off_v[3];    // the correction still being eased in, as of off_ns, and its rate
+    int64_t off_ns;
+    unsigned accepted, rejected, restarts;   // counts, for the log
+} strack_fusion;
+
+void strack_fusion_init(strack_fusion *f);
+// Forget the position (recentering); the IMU's readings stay.
+void strack_fusion_reset(strack_fusion *f);
+// An IMU reading: when, and the acceleration in the world (m/s2), gravity taken out. In order.
+void strack_fusion_imu(strack_fusion *f, int64_t t_ns, const float accel[3]);
+// A fit: the exposure time, the LED model's position in the world, how many LEDs and how well.
+// Returns whether it was taken in.
+bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int leds, float rms_px);
+// The position and velocity at t_ns, carried on by the IMU's readings since the last fit; false if
+// no fit was taken in for max_age_ns.
+bool strack_fusion_predict(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]);
 
 #ifdef __cplusplus
 }

@@ -319,12 +319,14 @@ static bool slam_position(float out[3]) {
 //
 // The headset's lower cameras see the controllers' LEDs, which sense.c keeps lit while this runs.
 // The camera thread hands each frame to tracking_thread, which finds the controllers in it
-// (sense_track.c) and feeds a smoothed position for each into g_optical. hand_motion uses that
+// (sense_track.c) and feeds each fit into g_fusion, which carries the position on between fits
+// with the controller's own accelerometer and leaves out fits that jump. hand_motion uses that
 // while it is fresh, and the arm model otherwise, easing from one to the other. The tracker also
 // tells how far each controller's IMU yaw has drifted, and g_ctl_yaw takes that in bit by bit.
 
 static strack *g_tracker;                   // the tracking thread's
-static strack_filter g_optical[2];          // under g_lock
+static strack_fusion g_fusion[2];          // under g_lock
+static int64_t g_fusion_imu_after[2];       // the last IMU reading fed to it
 static int64_t g_optical_seen[2];           // exposure time of the last frame each was seen in
 static volatile bool g_tracker_reset;       // the world turned (recentering): start following afresh
 static struct {
@@ -334,6 +336,22 @@ static struct {
     float last[3];
     bool have_last;
 } g_blend[2];                // under g_lock
+
+static quat g_ctl_yaw[2];
+// The controller's new IMU readings into its fusion, as accelerations in the room: turned by its
+// orientation then and by g_ctl_yaw, gravity taken out. Under g_lock.
+static void feed_imu(int hand) {
+    sense_sample ss[64];
+    int n = sense_samples(hand, g_fusion_imu_after[hand], ss, 64);
+    for (int i = 0; i < n; i++) {
+        quat q = qmul(g_ctl_yaw[hand], (quat){ss[i].q[0], ss[i].q[1], ss[i].q[2], ss[i].q[3]});
+        float a[3];
+        qrot(q, ss[i].accel, a);
+        a[1] -= 9.80665f;
+        strack_fusion_imu(&g_fusion[hand], ss[i].t_ns, a);
+    }
+    if (n) g_fusion_imu_after[hand] = ss[n - 1].t_ns;
+}
 
 static bool optically_tracked(int hand, int64_t within_ns) {
     pthread_mutex_lock(&g_lock);
@@ -402,8 +420,7 @@ static void recenter(void) {
         if (optically_tracked(h, 2000000000LL)) {
             pthread_mutex_lock(&g_lock);
             g_ctl_yaw[h] = qnorm(qmul(turn, g_ctl_yaw[h]));
-            g_optical[h].have = false;
-            g_optical[h].e_have = false;
+            strack_fusion_reset(&g_fusion[h]);
             pthread_mutex_unlock(&g_lock);
         } else {
             align_controller(h, 0);
@@ -494,7 +511,8 @@ static axr_motion hand_motion(int hand, int64_t time) {
     // between that and the arm model eases over a fraction of a second instead of jumping.
     float seen[3], vel[3], base[3];
     pthread_mutex_lock(&g_lock);
-    bool optical = g_cfg.controller_tracking && strack_filter_predict(&g_optical[hand], time, 250000000, seen, vel);
+    feed_imu(hand);
+    bool optical = g_cfg.controller_tracking && strack_fusion_predict(&g_fusion[hand], time, 250000000, seen, vel);
     memcpy(base, optical ? seen : m.pose.position, sizeof base);
     if (optical != g_blend[hand].optical) {
         for (int i = 0; i < 3; i++) g_blend[hand].from[i] = g_blend[hand].have_last ? g_blend[hand].last[i] - base[i] : 0;
@@ -520,9 +538,9 @@ static bool g_track_has[STRACK_CAMERAS];
 static double g_track_arrived;
 static bool g_track_pending, g_track_is_half;
 // The headset's spot finder (cpsvr2.h): its newest packet, for captures; and, while the cameras are
-// in the tracking mode, the dots of all four cameras on every exposure, where the pictures bring
-// the upper pair only every other one. PSVR2XR_TRACK_SPOTS=0 goes back to finding them in the
-// pictures.
+// in the tracking mode, PSVR2XR_TRACK_SPOTS=1 takes the dots from it, 19 ms sooner than the
+// pictures come. It isn't the default: at 32 it runs LEDs close together into one spot, which
+// cost a controller seen from the side a third of its LEDs on the bench.
 static unsigned char g_ld_packet[4][PSVR2_LD_PACKET_BYTES], g_track_ld[PSVR2_LD_PACKET_BYTES];   // the last 4
 static unsigned g_ld_count;
 static double g_stat_ld_ahead_s; static unsigned g_stat_ld_ahead_n;   // under g_track_lock
@@ -534,7 +552,8 @@ static double g_lower_wait_arrived;
 static bool g_lower_waiting;
 
 // Statistics for the status line, under g_lock.
-static unsigned g_stat_track_frames, g_stat_track_dots[STRACK_CAMERAS], g_stat_track_seen[2], g_stat_track_leds[2];
+static unsigned g_stat_track_frames, g_stat_track_dots[STRACK_CAMERAS], g_stat_track_seen[2], g_stat_track_leds[2],
+    g_stat_track_left_out[2];
 static float g_stat_track_rms[2];
 
 static void camera_frame(const unsigned char *header, const unsigned char *left, const unsigned char *right,
@@ -720,19 +739,36 @@ static void load_cameras(strack_camera cams[STRACK_CAMERAS]) {
 // tracking mode: the lower pair's header and two pictures, then the upper pair's, zeros for a pair
 // that didn't come), with a line per frame in frames.jsonl of what the tracker was given and found,
 // to work out from them what's wrong.
-static FILE *g_capture;
+// PSVR2XR_CAPTURE_PICTURES=0 leaves the pictures out (the spot finder's packets stay), so
+// PSVR2XR_CAPTURE_EVERY=1 and PSVR2XR_CAPTURE_FRAMES=3600 can keep a minute at the full rate; the
+// controllers' IMU readings go to imu.jsonl.
+static FILE *g_capture, *g_capture_imu;
 static NSString *g_capture_dir;
 static unsigned g_capture_frames, g_capture_saved;
+static int64_t g_capture_imu_after[2];
 
 static void capture_frame(bool half, const unsigned char *header, unsigned char *const planes[2],
                           unsigned char headers[2][256], unsigned char *const pictures[STRACK_CAMERAS],
-                          const bool has[STRACK_CAMERAS], const strack_input *in, const strack_result r[2]) {
-    static int every;
+                          const bool has[STRACK_CAMERAS], const strack_input *in, const strack_result r[2],
+                          const unsigned char *ld_used) {
+    static int every, limit = -1, with_pictures = -1;
     if (!every) every = getenv("PSVR2XR_CAPTURE_EVERY") ? atoi(getenv("PSVR2XR_CAPTURE_EVERY")) : 4;
     if (every < 1) every = 1;
-    if (!g_capture || g_capture_saved >= 300 || g_capture_frames++ % every) return;
+    if (limit < 0) limit = getenv("PSVR2XR_CAPTURE_FRAMES") ? atoi(getenv("PSVR2XR_CAPTURE_FRAMES")) : 300;
+    if (with_pictures < 0) with_pictures = !getenv("PSVR2XR_CAPTURE_PICTURES") || atoi(getenv("PSVR2XR_CAPTURE_PICTURES"));
+    if (!g_capture || g_capture_saved >= (unsigned)limit) return;
+    for (int h = 0; h < 2 && g_capture_imu; h++) {
+        sense_sample ss[512];
+        int n = sense_samples(h, g_capture_imu_after[h], ss, 512);
+        for (int i = 0; i < n; i++)
+            fprintf(g_capture_imu, "{\"hand\": %d, \"t\": %lld, \"q\": [%.6f, %.6f, %.6f, %.6f], \"a\": [%.4f, %.4f, %.4f], \"g\": [%.4f, %.4f, %.4f]}\n",
+                    h, (long long)ss[i].t_ns, ss[i].q[0], ss[i].q[1], ss[i].q[2], ss[i].q[3], ss[i].accel[0], ss[i].accel[1],
+                    ss[i].accel[2], ss[i].gyro[0], ss[i].gyro[1], ss[i].gyro[2]);
+        if (n) g_capture_imu_after[h] = ss[n - 1].t_ns;
+    }
+    if (g_capture_frames++ % every) return;
     NSString *name = [NSString stringWithFormat:half ? @"frame_%03u.m4" : @"frame_%03u.bin", g_capture_saved++];
-    FILE *f = fopen([g_capture_dir stringByAppendingPathComponent:name].fileSystemRepresentation, "wb");
+    FILE *f = with_pictures ? fopen([g_capture_dir stringByAppendingPathComponent:name].fileSystemRepresentation, "wb") : NULL;
     if (f && !half) {
         fwrite(header, 1, 256, f);
         fwrite(planes[0], 1, PSVR2_CAM_PLANE_BYTES, f);
@@ -751,14 +787,15 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
     pthread_mutex_lock(&g_track_lock);
     bool ld = g_ld_have;
     static unsigned char ld_copy[PSVR2_LD_PACKET_BYTES];
-    if (ld) {
+    if (ld_used) memcpy(ld_copy, ld_used, sizeof ld_copy);
+    else if (ld) {
         int pick = (g_ld_count - 1) % 4;
         for (int i = 0; i < 4 && half; i++)
             if (!memcmp(g_ld_packet[i] + 8, headers[1] + 8, 4)) pick = i;
         memcpy(ld_copy, g_ld_packet[pick], sizeof ld_copy);
     }
     pthread_mutex_unlock(&g_track_lock);
-    if (ld) {
+    if (ld || ld_used) {
         NSString *ld_name = [NSString stringWithFormat:@"ld_%03u.bin", g_capture_saved - 1];
         FILE *lf = fopen([g_capture_dir stringByAppendingPathComponent:ld_name].fileSystemRepresentation, "wb");
         if (lf) { fwrite(ld_copy, 1, sizeof ld_copy, lf); fclose(lf); }
@@ -768,6 +805,10 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
             in->head.p[0], in->head.p[1], in->head.p[2]);
     for (int h = 0; h < 2; h++) {
         fprintf(g_capture, ", \"%s\": {\"imu\": %s", h ? "right" : "left", in->prior_valid[h] ? "true" : "false");
+        pthread_mutex_lock(&g_lock);
+        quat al = g_ctl_yaw[h];
+        pthread_mutex_unlock(&g_lock);
+        fprintf(g_capture, ", \"align_q\": [%.6f, %.6f, %.6f, %.6f]", al.x, al.y, al.z, al.w);
         if (in->prior_valid[h])
             fprintf(g_capture, ", \"prior_q\": [%.6f, %.6f, %.6f, %.6f]", in->prior_q[h][0], in->prior_q[h][1],
                     in->prior_q[h][2], in->prior_q[h][3]);
@@ -788,7 +829,8 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
     }
     fprintf(g_capture, "}\n");
     fflush(g_capture);
-    if (g_capture_saved == 300) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
+    if (g_capture_imu) fflush(g_capture_imu);
+    if (g_capture_saved == (unsigned)limit) axr_log("controller capture done: %s", g_capture_dir.UTF8String);
 }
 
 // Finds where in the frame the LEDs must flash to be in the pictures: each shift in turn (1.5 ms
@@ -941,7 +983,13 @@ static void *tracking_thread(void *arg) {
         for (int c = 0; c < STRACK_CAMERAS; c++) g_stat_track_dots[c] += dots[c];
         for (int h = 0; h < 2; h++) {
             if (!r[h].valid) continue;
-            strack_filter_update(&g_optical[h], r[h].pose.p, exposed);
+            feed_imu(h);
+            // A fit the fusion leaves out (far from where the accelerometer says the controller
+            // went: on the wrong dots) doesn't correct the IMU's yaw either.
+            if (!strack_fusion_optical(&g_fusion[h], exposed, r[h].pose.p, r[h].leds, r[h].rms_px)) {
+                g_stat_track_left_out[h]++;
+                continue;
+            }
             g_optical_seen[h] = exposed;
             // The IMU's yaw toward the cameras', a little at a time, and only from fits on plenty of
             // LEDs: weak fits fed back here at a tenth a frame spun a controller half a turn in ten
@@ -962,7 +1010,7 @@ static void *tracking_thread(void *arg) {
         }
         pthread_mutex_unlock(&g_lock);
 
-        capture_frame(half || spots, header, planes, headers, pictures, has, &in, r);
+        capture_frame(half || spots, header, planes, headers, pictures, has, &in, r, spots ? ld : NULL);
         float rms;
         int calibrations = strack_calibration(g_tracker, &rms);
         if (calibrations > saved_calibrations && axr_now_ns() - last_save > 20000000000LL) {
@@ -982,10 +1030,8 @@ static void *tracking_thread(void *arg) {
 
 static void start_controller_tracking(void) {
     for (int h = 0; h < 2; h++) {
-        strack_filter_init(&g_optical[h]);
-        float s = g_cfg.controller_smoothing;
-        g_optical[h].min_hz = s > 0 ? g_optical[h].min_hz / s : 0;
-        g_optical[h].beta = s > 0 ? g_optical[h].beta / s : 0;
+        strack_fusion_init(&g_fusion[h]);
+        g_fusion[h].blend_s *= g_cfg.controller_smoothing;   // how long a correction takes to ease in
     }
     strack_camera cams[STRACK_CAMERAS];
     load_cameras(cams);
@@ -1009,6 +1055,7 @@ static void start_controller_tracking(void) {
         g_capture_dir = @(capture);
         [NSFileManager.defaultManager createDirectoryAtPath:g_capture_dir withIntermediateDirectories:YES attributes:nil error:nil];
         g_capture = fopen([g_capture_dir stringByAppendingPathComponent:@"frames.jsonl"].fileSystemRepresentation, "w");
+        g_capture_imu = fopen([g_capture_dir stringByAppendingPathComponent:@"imu.jsonl"].fileSystemRepresentation, "w");
         save_cameras(cams, 0);
         [NSFileManager.defaultManager copyItemAtPath:cameras_path()
                                               toPath:[g_capture_dir stringByAppendingPathComponent:@"controller_cameras.json"]
@@ -1018,7 +1065,7 @@ static void start_controller_tracking(void) {
     psvr2_camera_set_listener(camera_frame, NULL);
     psvr2_camera_set_tracking_listener(tracking_frame, NULL);
     const char *spots = getenv("PSVR2XR_TRACK_SPOTS");
-    g_use_spots = !spots || atoi(spots);
+    g_use_spots = spots && atoi(spots);
     psvr2_camera_set_led_detector_listener(led_detector_frame, NULL);
     if (psvr2_camera_start_tracking() != 0) {
         axr_log("controller tracking: the headset's cameras did not start; using the arm model");
@@ -1833,22 +1880,25 @@ static void *status_thread(void *arg) {
                 pthread_mutex_lock(&g_lock);
                 unsigned frames = g_stat_track_frames, dots[STRACK_CAMERAS],
                          seen[2] = {g_stat_track_seen[0], g_stat_track_seen[1]},
-                         leds[2] = {g_stat_track_leds[0], g_stat_track_leds[1]};
+                         leds[2] = {g_stat_track_leds[0], g_stat_track_leds[1]},
+                         left_out[2] = {g_stat_track_left_out[0], g_stat_track_left_out[1]};
                 float rms[2] = {g_stat_track_rms[0], g_stat_track_rms[1]};
                 memcpy(dots, g_stat_track_dots, sizeof dots);
                 g_stat_track_frames = 0;
                 memset(g_stat_track_dots, 0, sizeof g_stat_track_dots);
                 memset(g_stat_track_seen, 0, sizeof g_stat_track_seen);
+                memset(g_stat_track_left_out, 0, sizeof g_stat_track_left_out);
                 memset(g_stat_track_leds, 0, sizeof g_stat_track_leds);
                 memset(g_stat_track_rms, 0, sizeof g_stat_track_rms);
                 pthread_mutex_unlock(&g_lock);
                 float cal_rms;
                 int cal = strack_calibration(g_tracker, &cal_rms);
-                char side[2][96];
+                char side[2][128];
                 for (int h = 0; h < 2; h++) {
                     if (seen[h])
-                        snprintf(side[h], sizeof side[h], "seen in %.0f%% of frames (%.1f LEDs, %.2f px)",
-                                 frames ? 100.0 * seen[h] / frames : 0, (double)leds[h] / seen[h], rms[h] / seen[h]);
+                        snprintf(side[h], sizeof side[h], "seen in %.0f%% of frames (%.1f LEDs, %.2f px; %u fits left out)",
+                                 frames ? 100.0 * seen[h] / frames : 0, (double)leds[h] / seen[h], rms[h] / seen[h],
+                                 left_out[h]);
                     else
                         snprintf(side[h], sizeof side[h], "not seen%s",
                                  sense_leds_on(h) ? "" : " (its LEDs are off: is it connected?)");

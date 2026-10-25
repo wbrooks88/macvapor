@@ -77,6 +77,10 @@ typedef struct {
     bool vib_dirty;
     unsigned crc_errors, reports;
     sense_state state;
+    // The IMU's readings, for sense_samples(): its ticks unwrapped, and a ring of the last ones.
+    int64_t imu_ticks64;
+    sense_sample hist[512];
+    unsigned nhist;
 } controller;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -289,6 +293,22 @@ static void handle_report(controller *c, int hand, const uint8_t *r, CFIndex len
         fuse(c, gyro, accel, dt, t);
         memcpy(s->orientation, c->q, sizeof c->q);
         qrot(c->q, gyro, s->angular_velocity);
+        // When it was read, in our clock: the IMU's ticks (thirds of a microsecond) less the
+        // controller's clock offset found from the quickest reports.
+        if (c->imu_ticks) c->imu_ticks64 += (uint32_t)(ticks - c->imu_ticks);
+        else c->imu_ticks64 = ticks;
+        int n = c->clock_n < 64 ? c->clock_n : 64;
+        int64_t off = INT64_MIN;
+        for (int i = 0; i < n; i++)
+            if (c->clock_off[i] > off) off = c->clock_off[i];
+        // the IMU's ticks and the report's are the same clock (Monado reads both as device time)
+        int64_t when = n ? c->imu_ticks64 * 1000 / 3 - off : t;
+        if (when > t || when < t - 50000000) when = t;
+        sense_sample *h = &c->hist[c->nhist++ % 512];
+        h->t_ns = when;
+        memcpy(h->q, c->q, sizeof h->q);
+        memcpy(h->accel, accel, sizeof h->accel);
+        memcpy(h->gyro, gyro, sizeof h->gyro);
     }
     c->imu_ticks = ticks;
     s->updated_ns = t;
@@ -550,6 +570,18 @@ bool sense_get(int hand, sense_state *out) {
     *out = g_ctl[hand].state;
     pthread_mutex_unlock(&g_lock);
     return out->connected;
+}
+
+int sense_samples(int hand, int64_t after_ns, sense_sample *out, int max) {
+    if (hand != SENSE_LEFT && hand != SENSE_RIGHT) return 0;
+    pthread_mutex_lock(&g_lock);
+    controller *c = &g_ctl[hand];
+    unsigned have = c->nhist < 512 ? c->nhist : 512, first = c->nhist - have;
+    while (have && c->hist[first % 512].t_ns <= after_ns) { first++; have--; }
+    int n = have < (unsigned)max ? (int)have : max;
+    for (int i = 0; i < n; i++) out[i] = c->hist[(first + i) % 512];
+    pthread_mutex_unlock(&g_lock);
+    return n;
 }
 
 uint64_t sense_generation(void) {

@@ -47,6 +47,19 @@ typedef struct {
 // out of its top), from Monado's LED model: 50.27 degrees about X.
 extern const float sense_imu_to_grip[4];
 
+// One IMU reading as it came: when (CLOCK_MONOTONIC ns, the controller's own clock tied to ours
+// by the quickest reports, so Bluetooth's delays don't jitter it), the fused orientation then (as
+// in sense_state), and the accelerometer (m/s2) and gyro (rad/s) in the IMU's axes.
+typedef struct {
+    int64_t t_ns;
+    float q[4];
+    float accel[3], gyro[3];
+} sense_sample;
+
+// The readings newer than after_ns, oldest first, up to max of the last 512 (about 2 s); returns
+// how many.
+int sense_samples(int hand, int64_t after_ns, sense_sample *out, int max);
+
 void sense_start(void);                       // idempotent; finds controllers as they connect
 bool sense_get(int hand, sense_state *out);   // false if that controller isn't connected
 uint64_t sense_generation(void);              // bumps on every input report

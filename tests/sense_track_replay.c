@@ -196,11 +196,13 @@ int main(int argc, char **argv) {
         int half = strstr(name, ".m4") != NULL;
         snprintf(path, sizeof path, "%s/%s", argv[1], name);
         FILE *fb = fopen(path, "rb");
-        if (!fb) continue;
         size_t want = half ? 2 * (256 + 2 * TP) : 256 + 2 * PB;
-        size_t got = fread(buf, 1, want, fb);
-        fclose(fb);
-        if (got != want) continue;
+        size_t got = fb ? fread(buf, 1, want, fb) : 0;
+        if (fb) fclose(fb);
+        if (got != want) {
+            if (!use_spots) continue;
+            memset(buf, 0, want);   // a capture without the pictures
+        }
         strack_input in = {0};
         in.time_ns = (long long)jnum(line, "time_ns");
         char *hd = strstr(line, "\"head\"");
@@ -220,8 +222,8 @@ int main(int argc, char **argv) {
         }
         bool spots = false;
         if (use_spots) {
-            char ldname[96];
-            snprintf(ldname, sizeof ldname, "%s/ld_%.3s.bin", argv[1], name + 6);
+            char ldname[1024];
+            snprintf(ldname, sizeof ldname, "%s/ld_%.*s.bin", argv[1], (int)strcspn(name + 6, "."), name + 6);
             FILE *fs = fopen(ldname, "rb");
             spots = fs && fread(ld, 1, sizeof ld, fs) == sizeof ld && ld[0] == 'L' && ld[1] == 'D';
             if (fs) fclose(fs);
@@ -279,8 +281,9 @@ int main(int argc, char **argv) {
             if (!r[h].valid) { printf(" | %s -", h ? "R" : "L"); continue; }
             float ph[3], d[3] = {r[h].pose.p[0] - in.head.p[0], r[h].pose.p[1] - in.head.p[1], r[h].pose.p[2] - in.head.p[2]};
             qrot(hqc, d, ph);
-            printf(" | %s head(%.2f %.2f %.2f) leds %d rms %.2f yaw %.0f%s", h ? "R" : "L", ph[0], ph[1], ph[2], r[h].leds,
-                   r[h].rms_px, r[h].yaw_error * 57.3f, r[h].found ? " found" : "");
+            printf(" | %s head(%.4f %.4f %.4f) leds %d rms %.2f yaw %.0f%s world(%.4f %.4f %.4f) t %lld", h ? "R" : "L", ph[0],
+                   ph[1], ph[2], r[h].leds, r[h].rms_px, r[h].yaw_error * 57.3f, r[h].found ? " found" : "", r[h].pose.p[0],
+                   r[h].pose.p[1], r[h].pose.p[2], (long long)in.time_ns);
             if (!draw) continue;
             for (int c = 0; c < STRACK_CAMERAS; c++) {
                 if (cc[c].off) continue;

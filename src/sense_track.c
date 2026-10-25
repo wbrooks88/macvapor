@@ -1321,68 +1321,207 @@ void strack_shift_yaw(strack *t, int hand, float angle) {
 
 // ------------------------------------------------------------------------------------ smoothing
 
-void strack_filter_init(strack_filter *f) {
+// ------------------------------------------------------------------------------------ fusion
+
+void strack_fusion_init(strack_fusion *f) {
     memset(f, 0, sizeof *f);
-    f->min_hz = 1.5f;
-    f->beta = 8;
+    f->accel_noise = 1.5f;
+    f->bias_walk = 0.3f;
+    f->sigma_scale = 2;
+    f->gate = 4;
+    f->blend_s = 0.04f;
+    // Cross-correlating the fits' acceleration with the accelerometer's put its readings 5 ms
+    // later than the exposure times the cameras' were given.
+    f->imu_lag_s = 0.005f;
 }
 
-static float euro_alpha(float hz, float dt) {
-    float tau = 1 / (2 * PI_F * hz);
-    return 1 / (1 + tau / dt);
+void strack_fusion_reset(strack_fusion *f) {
+    f->main.have = f->challenger.have = false;
+    f->rejects = f->ch_n = 0;
+    memset(f->off, 0, sizeof f->off);
+    memset(f->off_v, 0, sizeof f->off_v);
+    f->off_ns = 0;
 }
 
-// The one-euro filter: its speed from the change in the raw position, smoothed at 2 Hz; then the
-// position smoothed with a cutoff that rises with that speed. Starts afresh after a gap.
-static void euro(strack_filter *f, const float in[3], int64_t t_ns, float out[3]) {
-    float dt = (t_ns - f->e_t_ns) / 1e9f;
-    if (f->min_hz <= 0 || !f->e_have || dt <= 0 || dt > 0.3f) {
-        memcpy(f->e_p, in, sizeof f->e_p);
-        memset(f->e_dp, 0, sizeof f->e_dp);
-        f->e_have = true;
-        f->e_t_ns = t_ns;
-        memcpy(out, in, 3 * sizeof *out);
-        return;
-    }
-    float ad = euro_alpha(2, dt), speed = 0;
+void strack_fusion_imu(strack_fusion *f, int64_t t_ns, const float accel[3]) {
+    t_ns -= (int64_t)(f->imu_lag_s * 1e9f);
+    if (f->nimu && t_ns <= f->imu[(f->nimu - 1) % STRACK_IMU_RING].t_ns) return;
+    f->imu[f->nimu % STRACK_IMU_RING].t_ns = t_ns;
+    memcpy(f->imu[f->nimu % STRACK_IMU_RING].a, accel, sizeof f->imu[0].a);
+    f->nimu++;
+}
+
+static void track_step(const strack_fusion *f, strack_track *tr, const float a[3], float dt) {
+    float q = f->accel_noise * f->accel_noise, dt2 = dt * dt;
     for (int k = 0; k < 3; k++) {
-        f->e_dp[k] += ad * ((in[k] - f->e_p[k]) / dt - f->e_dp[k]);
-        speed += f->e_dp[k] * f->e_dp[k];
+        float *x = tr->x[k], u = a[k] - x[2];
+        x[0] += x[1] * dt + 0.5f * u * dt2;
+        x[1] += u * dt;
+        // P = F P F' + Q, F = [1 dt -dt^2/2; 0 1 -dt; 0 0 1]
+        float F[3][3] = {{1, dt, -0.5f * dt2}, {0, 1, -dt}, {0, 0, 1}}, FP[3][3], (*P)[3] = tr->P[k];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) FP[i][j] = F[i][0] * P[0][j] + F[i][1] * P[1][j] + F[i][2] * P[2][j];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) P[i][j] = FP[i][0] * F[j][0] + FP[i][1] * F[j][1] + FP[i][2] * F[j][2];
+        P[0][0] += q * dt2 * dt / 3;
+        P[0][1] += q * dt2 / 2;
+        P[1][0] += q * dt2 / 2;
+        P[1][1] += q * dt;
+        P[2][2] += f->bias_walk * f->bias_walk * dt;
     }
-    float a = euro_alpha(f->min_hz + f->beta * sqrtf(speed), dt);
-    for (int k = 0; k < 3; k++) f->e_p[k] += a * (in[k] - f->e_p[k]);
-    f->e_t_ns = t_ns;
-    memcpy(out, f->e_p, sizeof f->e_p);
 }
 
-void strack_filter_update(strack_filter *f, const float p_in[3], int64_t t_ns) {
-    float p[3];
-    euro(f, p_in, t_ns, p);
-    float dt = (t_ns - f->t_ns) / 1e9f;
-    if (!f->have || dt <= 0 || dt > 0.3f || t_ns - f->last_seen_ns > 300000000) {
-        memcpy(f->p, p, sizeof f->p);
-        memset(f->v, 0, sizeof f->v);
-    } else {
-        const float alpha = 0.6f, beta = 0.25f;
-        for (int k = 0; k < 3; k++) {
-            float pred = f->p[k] + f->v[k] * dt, r = p[k] - pred;
-            f->p[k] = pred + alpha * r;
-            f->v[k] = fmaxf(-6, fminf(6, f->v[k] + beta * r / dt));
+// On to t_ns through the IMU's readings since the state's time, each held until the next.
+static void track_propagate(const strack_fusion *f, strack_track *tr, int64_t t_ns) {
+    if (t_ns <= tr->t_ns) return;
+    unsigned have = f->nimu < STRACK_IMU_RING ? f->nimu : STRACK_IMU_RING, first = f->nimu - have;
+    // the last reading at or before the state's time
+    unsigned i = f->nimu;
+    while (i > first && f->imu[(i - 1) % STRACK_IMU_RING].t_ns > tr->t_ns) i--;
+    static const float none[3] = {0, 0, 0};
+    const float *a = i > first ? f->imu[(i - 1) % STRACK_IMU_RING].a : none;
+    int64_t t = tr->t_ns;
+    while (t < t_ns) {
+        int64_t next = i < f->nimu ? f->imu[i % STRACK_IMU_RING].t_ns : t_ns;
+        if (next > t_ns) next = t_ns;
+        if (next > t) track_step(f, tr, a, (next - t) / 1e9f);
+        t = next;
+        if (i < f->nimu && f->imu[i % STRACK_IMU_RING].t_ns <= t) a = f->imu[i++ % STRACK_IMU_RING].a;
+    }
+    tr->t_ns = t_ns;
+}
+
+static void track_start(strack_track *tr, int64_t t_ns, const float p[3], float sigma) {
+    tr->have = true;
+    tr->t_ns = t_ns;
+    memset(tr->P, 0, sizeof tr->P);
+    for (int k = 0; k < 3; k++) {
+        tr->x[k][0] = p[k];
+        tr->x[k][1] = tr->x[k][2] = 0;
+        tr->P[k][0][0] = sigma * sigma;
+        tr->P[k][1][1] = 1.5f * 1.5f;
+        tr->P[k][2][2] = 0.3f * 0.3f;
+    }
+}
+
+// The squared distance of p from where the track has it at t_ns, in deviations.
+static float track_d2(const strack_fusion *f, const strack_track *tr, int64_t t_ns, const float p[3], float sigma) {
+    strack_track c = *tr;
+    track_propagate(f, &c, t_ns);
+    float d2 = 0;
+    for (int k = 0; k < 3; k++) {
+        float r = p[k] - c.x[k][0];
+        d2 += r * r / (c.P[k][0][0] + sigma * sigma);
+    }
+    return d2;
+}
+
+static void track_update(const strack_fusion *f, strack_track *tr, int64_t t_ns, const float p[3], float sigma) {
+    track_propagate(f, tr, t_ns);
+    for (int k = 0; k < 3; k++) {
+        float (*P)[3] = tr->P[k], s = P[0][0] + sigma * sigma, K[3] = {P[0][0] / s, P[1][0] / s, P[2][0] / s};
+        float r = p[k] - tr->x[k][0], row0[3] = {P[0][0], P[0][1], P[0][2]};
+        for (int i = 0; i < 3; i++) {
+            tr->x[k][i] += K[i] * r;
+            for (int j = 0; j < 3; j++) P[i][j] -= K[i] * row0[j];
         }
     }
-    f->have = true;
-    f->t_ns = t_ns;
-    f->last_seen_ns = t_ns;
 }
 
-bool strack_filter_predict(const strack_filter *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]) {
-    if (!f->have || t_ns - f->last_seen_ns > max_age_ns) return false;
-    float dt = fmaxf(-0.05f, fminf(0.08f, (t_ns - f->t_ns) / 1e9f));
-    // Unseen for a while, it is less likely to keep going.
-    float unseen = (t_ns - f->last_seen_ns) / 1e9f, keep = unseen > 0.05f ? expf(-(unseen - 0.05f) / 0.1f) : 1;
+static void track_predict(const strack_fusion *f, const strack_track *tr, int64_t t_ns, float out[3], float vel[3]) {
+    strack_track c = *tr;
+    // The newest reading's acceleration is held for about the time to the next (they come 66 times
+    // a second), then the velocity carries on.
+    int64_t last = (f->nimu ? f->imu[(f->nimu - 1) % STRACK_IMU_RING].t_ns : c.t_ns) + 20000000;
+    track_propagate(f, &c, last < t_ns ? last : t_ns);
+    float dt = (t_ns - c.t_ns) / 1e9f;
+    if (dt < 0) dt = 0;
     for (int k = 0; k < 3; k++) {
-        out[k] = f->p[k] + f->v[k] * dt * keep;
-        if (vel) vel[k] = f->v[k] * keep;
+        out[k] = c.x[k][0] + c.x[k][1] * dt;
+        if (vel) vel[k] = c.x[k][1];
+    }
+}
+
+// The correction still to ease in at t_ns: the old path less the new one, fading.
+static void offset_at(const strack_fusion *f, int64_t t_ns, float o[3], float ov[3]) {
+    float dt = (t_ns - f->off_ns) / 1e9f, e = f->off_ns && f->blend_s > 0 ? expf(-fmaxf(0, dt) / f->blend_s) : 0;
+    for (int k = 0; k < 3; k++) {
+        o[k] = (f->off[k] + f->off_v[k] * dt) * e;
+        if (ov) ov[k] = f->off_v[k] * e;
+    }
+}
+
+// The shown path stays where it was at ref, the change eased in from there.
+static void ease_in(strack_fusion *f, int64_t ref, const float before[3], const float vb[3]) {
+    float after[3], va[3], o[3], ov[3];
+    track_predict(f, &f->main, ref, after, va);
+    offset_at(f, ref, o, ov);
+    for (int k = 0; k < 3; k++) {
+        f->off[k] = o[k] + before[k] - after[k];
+        f->off_v[k] = ov[k] + vb[k] - va[k];
+    }
+    f->off_ns = ref;
+}
+
+bool strack_fusion_optical(strack_fusion *f, int64_t t_ns, const float p[3], int leds, float rms_px) {
+    float sigma = (leds >= 13 ? 0.003f : leds >= 9 ? 0.004f : leds >= 6 ? 0.008f : 0.02f) * f->sigma_scale *
+                  fmaxf(1, rms_px / 2);
+    if (f->main.have && t_ns - f->last_ns > 400000000) f->main.have = false;
+    if (f->main.have && t_ns <= f->main.t_ns) return false;
+    if (f->main.have && track_d2(f, &f->main, t_ns, p, sigma) <= f->gate * f->gate * 3) {
+        // Taken in, the change it makes to where the controller is shown eased in from now (about
+        // the newest IMU reading).
+        int64_t ref = f->nimu ? f->imu[(f->nimu - 1) % STRACK_IMU_RING].t_ns : t_ns;
+        if (ref < t_ns) ref = t_ns;
+        float before[3], vb[3];
+        track_predict(f, &f->main, ref, before, vb);
+        track_update(f, &f->main, t_ns, p, sigma);
+        ease_in(f, ref, before, vb);
+        f->last_ns = t_ns;
+        f->rejects = 0;
+        f->challenger.have = false;
+        f->accepted++;
+        return true;
+    }
+    if (f->main.have) {
+        f->rejects++;
+        f->rejected++;
+    }
+    // Left out, or nothing followed yet: the fits that agree with each other make a challenger, which
+    // takes over after three (two on 10 LEDs or more) once the followed one has missed as many.
+    strack_track *ch = &f->challenger;
+    if (ch->have && t_ns > ch->t_ns && t_ns - ch->t_ns < 200000000 && track_d2(f, ch, t_ns, p, sigma) <= f->gate * f->gate * 3) {
+        track_update(f, ch, t_ns, p, sigma);
+        f->ch_n++;
+        if (leds > f->ch_best) f->ch_best = leds;
+    } else {
+        track_start(ch, t_ns, p, sigma);
+        f->ch_n = 1;
+        f->ch_best = leds;
+    }
+    int need = f->ch_best >= 10 ? 2 : 3;
+    if (f->ch_n >= need && (!f->main.have || f->rejects >= 3)) {
+        f->main = *ch;
+        ch->have = false;
+        f->last_ns = t_ns;
+        f->rejects = 0;
+        memset(f->off, 0, sizeof f->off);
+        memset(f->off_v, 0, sizeof f->off_v);
+        f->off_ns = 0;
+        f->restarts++;
+        return true;
+    }
+    return false;
+}
+
+bool strack_fusion_predict(const strack_fusion *f, int64_t t_ns, int64_t max_age_ns, float out[3], float vel[3]) {
+    if (!f->main.have || t_ns - f->last_ns > max_age_ns) return false;
+    float o[3], ov[3];
+    track_predict(f, &f->main, t_ns, out, vel);
+    offset_at(f, t_ns, o, ov);
+    for (int k = 0; k < 3; k++) {
+        out[k] += o[k];
+        if (vel) vel[k] += ov[k];
     }
     return true;
 }
