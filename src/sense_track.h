@@ -57,6 +57,7 @@ typedef struct {
     // than pred_veto_m from it (0: any) is left out. Off: on the 80 s recording of fast moves
     // (0.03, 0.06, 0.15) found the controllers in 2% more frames but was no closer once fused.
     float pred_max_sigma, pred_jump_m, pred_veto_m;
+    int poor_dots;          // this many dots left unexplained near a fit on under 10 LEDs: search afresh
 } strack_params;
 
 void strack_default_params(strack_params *out);
@@ -93,6 +94,8 @@ typedef struct {
                                    // the prior by this about the world's up to match
     int leds;                      // LEDs matched to dots, over both cameras
     float rms_px;
+    int expected;                  // LEDs the pose turns squarely to a camera, in its picture
+    float tilt_error[2];           // radians the prior is tilted off by, about the world's x and z
 } strack_result;
 
 typedef struct strack strack;

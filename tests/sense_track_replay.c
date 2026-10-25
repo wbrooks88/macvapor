@@ -16,7 +16,8 @@
 // the dots the tracker found live, from frames.jsonl (a capture without pictures). With the
 // capture's imu.jsonl: IMU=1 takes each controller's orientation from its IMU at the exposure
 // (PRIOR_LAG ms after it, default 5) instead of the one the tracker was given live; FUSE=1 runs
-// strack_fusion alongside and gives the tracker its prediction (pred_p).
+// strack_fusion alongside and gives the tracker its prediction (pred_p). TILT=gain corrects each
+// controller's tilt from its fits as backend_psvr2.m does (0.03; for captures made before it did).
 
 #include "sense_track.h"
 
@@ -113,6 +114,8 @@ static void qmul(const float a[4], const float b[4], float o[4]) {
                   a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
     memcpy(o, r, sizeof r);
 }
+
+float g_replay_tiltq[2][4] = {{0, 0, 0, 1}, {0, 0, 0, 1}};
 
 // A capture's IMU readings, per hand, in order.
 typedef struct { long long t; float q[4], a[3]; } imu_rec;
@@ -254,6 +257,7 @@ int main(int argc, char **argv) {
     if (getenv("PRED_SIGMA")) prm.pred_max_sigma = atof(getenv("PRED_SIGMA"));
     if (getenv("PRED_JUMP")) prm.pred_jump_m = atof(getenv("PRED_JUMP"));
     if (getenv("PRED_VETO")) prm.pred_veto_m = atof(getenv("PRED_VETO"));
+    if (getenv("POOR")) prm.poor_dots = atoi(getenv("POOR"));
     prm.calibrate = getenv("CAL") != NULL;   // off, as in the headset
     strack *t = strack_create(cams, &prm);
     snprintf(path, sizeof path, "%s/frames.jsonl", argv[1]);
@@ -324,6 +328,13 @@ int main(int argc, char **argv) {
                 qmul(align, q, g);
                 qmul(g, to_grip, in.prior_q[h]);
             }
+            // TILT=gain: each controller's tilt taken in from its fits on TILT_LEDS (8) or more LEDs, a
+            // bit at a time, as g_ctl_yaw takes in its turn.
+            if (in.prior_valid[h] && getenv("TILT")) {
+                float o[4];
+                qmul(g_replay_tiltq[h], in.prior_q[h], o);
+                memcpy(in.prior_q[h], o, sizeof o);
+            }
             if (use_fuse) {
                 // The IMU's readings come in until the tracker gets this frame (about 25 ms after
                 // the exposure), less Bluetooth's couple of milliseconds.
@@ -371,6 +382,16 @@ int main(int argc, char **argv) {
         strack_solve(t, &in, r);
         for (int h = 0; h < 2 && use_fuse; h++)
             if (r[h].valid) strack_fusion_optical(&fz[h], in.time_ns, r[h].pose.p, r[h].leds, r[h].rms_px);
+        for (int h = 0; h < 2 && getenv("TILT"); h++) {
+            int need = getenv("TILT_LEDS") ? atoi(getenv("TILT_LEDS")) : 8;
+            if (!r[h].valid || r[h].leds < need || r[h].rms_px > 2.5f) continue;
+            float g = atof(getenv("TILT")), ex = g * r[h].tilt_error[0], ez = g * r[h].tilt_error[1];
+            float a = sqrtf(ex * ex + ez * ez), dq[4] = {0, 0, 0, 1};
+            if (a > 1e-9f) { dq[0] = ex / a * sinf(a / 2); dq[2] = ez / a * sinf(a / 2); dq[3] = cosf(a / 2); }
+            float o[4];
+            qmul(dq, g_replay_tiltq[h], o);
+            memcpy(g_replay_tiltq[h], o, sizeof o);
+        }
         strack_camera cc[STRACK_CAMERAS];
         strack_get_cameras(t, cc);
         printf("%s", name);
@@ -404,9 +425,12 @@ int main(int argc, char **argv) {
             if (!r[h].valid) { printf(" | %s -", h ? "R" : "L"); continue; }
             float ph[3], d[3] = {r[h].pose.p[0] - in.head.p[0], r[h].pose.p[1] - in.head.p[1], r[h].pose.p[2] - in.head.p[2]};
             qrot(hqc, d, ph);
-            printf(" | %s head(%.4f %.4f %.4f) leds %d rms %.2f yaw %.0f%s world(%.4f %.4f %.4f) t %lld", h ? "R" : "L", ph[0],
+            printf(" | %s head(%.4f %.4f %.4f) leds %d rms %.2f yaw %.0f%s world(%.4f %.4f %.4f) t %lld exp %d", h ? "R" : "L", ph[0],
                    ph[1], ph[2], r[h].leds, r[h].rms_px, r[h].yaw_error * 57.3f, r[h].found ? " found" : "", r[h].pose.p[0],
-                   r[h].pose.p[1], r[h].pose.p[2], (long long)in.time_ns);
+                   r[h].pose.p[1], r[h].pose.p[2], (long long)in.time_ns, r[h].expected);
+            printf(" tilt %.1f %.1f q %.5f %.5f %.5f %.5f prior %.5f %.5f %.5f %.5f", r[h].tilt_error[0] * 57.3f,
+                   r[h].tilt_error[1] * 57.3f, r[h].pose.q[0], r[h].pose.q[1], r[h].pose.q[2], r[h].pose.q[3], in.prior_q[h][0],
+                   in.prior_q[h][1], in.prior_q[h][2], in.prior_q[h][3]);
             if (!draw) continue;
             for (int c = 0; c < STRACK_CAMERAS; c++) {
                 if (cc[c].off) continue;

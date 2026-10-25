@@ -322,7 +322,8 @@ static bool slam_position(float out[3]) {
 // (sense_track.c) and feeds each fit into g_fusion, which carries the position on between fits
 // with the controller's own accelerometer and leaves out fits that jump. hand_motion uses that
 // while it is fresh, and the arm model otherwise, easing from one to the other. The tracker also
-// tells how far each controller's IMU yaw has drifted, and g_ctl_yaw takes that in bit by bit.
+// tells how far each controller's IMU yaw and tilt have drifted, and g_ctl_align takes that in bit
+// by bit.
 
 static strack *g_tracker;                   // the tracking thread's
 static strack_fusion g_fusion[2];          // under g_lock
@@ -337,14 +338,14 @@ static struct {
     bool have_last;
 } g_blend[2];                // under g_lock
 
-static quat g_ctl_yaw[2];
+static quat g_ctl_align[2];
 // The controller's new IMU readings into its fusion, as accelerations in the room: turned by its
-// orientation then and by g_ctl_yaw, gravity taken out. Under g_lock.
+// orientation then and by g_ctl_align, gravity taken out. Under g_lock.
 static void feed_imu(int hand) {
     sense_sample ss[64];
     int n = sense_samples(hand, g_fusion_imu_after[hand], ss, 64);
     for (int i = 0; i < n; i++) {
-        quat q = qmul(g_ctl_yaw[hand], (quat){ss[i].q[0], ss[i].q[1], ss[i].q[2], ss[i].q[3]});
+        quat q = qmul(g_ctl_align[hand], (quat){ss[i].q[0], ss[i].q[1], ss[i].q[2], ss[i].q[3]});
         float a[3];
         qrot(q, ss[i].accel, a);
         a[1] -= 9.80665f;
@@ -363,11 +364,12 @@ static bool optically_tracked(int hand, int64_t within_ns) {
 // ------------------------------------------------------------------------------- controllers
 //
 // A controller's orientation comes from its own IMU, level with gravity but with a yaw that is
-// wherever it started and drifts slowly; g_ctl_yaw turns it to match the room. It is set when a
+// wherever it started and drifts slowly; g_ctl_align turns it to match the room. It is set when a
 // controller connects, when the headset recenters, and when the controller's PS button is pressed,
-// each time taking the controller to be pointing the way the head faces.
+// each time taking the controller to be pointing the way the head faces. The cameras' fits then
+// correct its yaw and its tilt (the IMU's sense of level is often 5 to 15 degrees off) bit by bit.
 
-static quat g_ctl_yaw[2] = {{0, 0, 0, 1}, {0, 0, 0, 1}};
+static quat g_ctl_align[2] = {{0, 0, 0, 1}, {0, 0, 0, 1}};
 static bool g_ctl_aligned[2];
 static float g_torso_yaw;          // the arm model's shoulders, which follow the head's yaw loosely
 
@@ -377,7 +379,7 @@ static float yaw_of(quat q) {
     return atan2f(-fwd[0], -fwd[2]);
 }
 
-// The grip's orientation in the room, before g_ctl_yaw.
+// The grip's orientation in the room, before g_ctl_align.
 static quat raw_grip(const sense_state *s) {
     quat imu = {s->orientation[0], s->orientation[1], s->orientation[2], s->orientation[3]};
     quat to_grip = {sense_imu_to_grip[0], sense_imu_to_grip[1], sense_imu_to_grip[2], sense_imu_to_grip[3]};
@@ -390,7 +392,7 @@ static void align_controller(int hand, float head_yaw) {
     if (!sense_get(hand, &s)) return;
     float yaw = yaw_of(raw_grip(&s));
     pthread_mutex_lock(&g_lock);
-    g_ctl_yaw[hand] = qyaw(head_yaw - yaw);
+    g_ctl_align[hand] = qyaw(head_yaw - yaw);
     g_ctl_aligned[hand] = true;
     pthread_mutex_unlock(&g_lock);
 }
@@ -419,7 +421,7 @@ static void recenter(void) {
     for (int h = 0; h < 2; h++) {
         if (optically_tracked(h, 2000000000LL)) {
             pthread_mutex_lock(&g_lock);
-            g_ctl_yaw[h] = qnorm(qmul(turn, g_ctl_yaw[h]));
+            g_ctl_align[h] = qnorm(qmul(turn, g_ctl_align[h]));
             strack_fusion_reset(&g_fusion[h]);
             pthread_mutex_unlock(&g_lock);
         } else {
@@ -471,7 +473,7 @@ static axr_motion hand_motion(int hand, int64_t time) {
     sense_state s;
     if (!g_cfg.controllers || !sense_get(hand, &s) || !s.updated_ns) return m;
     pthread_mutex_lock(&g_lock);
-    quat align = g_ctl_yaw[hand];
+    quat align = g_ctl_align[hand];
     bool aligned = g_ctl_aligned[hand];
     pthread_mutex_unlock(&g_lock);
     if (!aligned) return m;
@@ -808,7 +810,7 @@ static void capture_frame(bool half, const unsigned char *header, unsigned char 
     for (int h = 0; h < 2; h++) {
         fprintf(g_capture, ", \"%s\": {\"imu\": %s", h ? "right" : "left", in->prior_valid[h] ? "true" : "false");
         pthread_mutex_lock(&g_lock);
-        quat al = g_ctl_yaw[h];
+        quat al = g_ctl_align[h];
         pthread_mutex_unlock(&g_lock);
         fprintf(g_capture, ", \"align_q\": [%.6f, %.6f, %.6f, %.6f]", al.x, al.y, al.z, al.w);
         if (in->prior_valid[h])
@@ -971,7 +973,7 @@ static void *tracking_thread(void *arg) {
                 continue;
             pthread_mutex_lock(&g_lock);
             bool aligned = g_ctl_aligned[h];
-            quat g = qnorm(qmul(g_ctl_yaw[h], raw_grip(&st)));
+            quat g = qnorm(qmul(g_ctl_align[h], raw_grip(&st)));
             pthread_mutex_unlock(&g_lock);
             if (!aligned) continue;
             in.prior_valid[h] = true;
@@ -1003,8 +1005,18 @@ static void *tracking_thread(void *arg) {
             float gain = r[h].leds >= 6 && r[h].rms_px <= 2.5f ? 0.03f : r[h].leds >= 4 && r[h].rms_px <= 1.5f ? 0.015f : 0;
             if (gain > 0) {
                 float a = gain * r[h].yaw_error;
-                g_ctl_yaw[h] = qnorm(qmul(qyaw(a), g_ctl_yaw[h]));
+                g_ctl_align[h] = qnorm(qmul(qyaw(a), g_ctl_align[h]));
                 strack_shift_yaw(g_tracker, h, a);
+            }
+            // Its tilt too, from fits on 8 LEDs or more: the IMU's level is often 5 to 15 degrees off
+            // what the cameras see, and a fit on a few LEDs then holds to a wrong tilt and lands on
+            // the wrong dots. (On recordings of play this halved the jumps of tens of centimetres.)
+            if (r[h].leds >= 8 && r[h].rms_px <= 2.5f) {
+                float ex = 0.03f * r[h].tilt_error[0], ez = 0.03f * r[h].tilt_error[1], a = sqrtf(ex * ex + ez * ez);
+                if (a > 1e-7f) {
+                    quat dq = {ex / a * sinf(a / 2), 0, ez / a * sinf(a / 2), cosf(a / 2)};
+                    g_ctl_align[h] = qnorm(qmul(dq, g_ctl_align[h]));
+                }
             }
             g_stat_track_seen[h]++;
             g_stat_track_leds[h] += r[h].leds;

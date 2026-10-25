@@ -199,7 +199,7 @@ void strack_default_cameras(strack_camera out[STRACK_CAMERAS]) {
 
 void strack_default_params(strack_params *p) {
     *p = (strack_params){.threshold = 170, .max_area = 600, .gate_px = 5, .min_leds = 5, .max_rms_px = 2.5f, .search_hz = 15, .calibrate = true,
-                         .pred_max_sigma = 0, .pred_jump_m = 0.06f, .pred_veto_m = 0.15f};
+                         .pred_max_sigma = 0, .pred_jump_m = 0.06f, .pred_veto_m = 0.15f, .poor_dots = 6};
 }
 
 // The camera's axes in the head: OpenCV's x right, y down, z forward, turned by yaw, pitch, roll.
@@ -248,6 +248,9 @@ void strack_unproject(const strack_camera *c, float u, float v, float ray[3]) {
 
 // ------------------------------------------------------------------------------------- tracker
 
+// A pose in the head: the LED model's orientation R and position p.
+typedef struct { float R[9], p[3]; } hpose;
+
 typedef struct { int cam, led, blob; float du, dv; } match;
 
 typedef struct {
@@ -262,12 +265,12 @@ typedef struct {
     int64_t locked_until_ns;    // the prior's yaw was confirmed recently: search near it only
     int64_t confirmed_ns;       // when a fit on plenty of LEDs last confirmed it
     bool tracking_poor;         // the last fit left many of its dots unexplained
+    bool unexplained_check;     // this frame's fit is to be checked for that
+    hpose check_P;
 } hand_state;
 
 enum { CAL_SAMPLES = 40 };
 
-// A pose in the head: the LED model's orientation R and position p.
-typedef struct { float R[9], p[3]; } hpose;
 
 // A frame kept for calibrating the cameras: what a controller's LEDs were matched to, and what its
 // IMU said about its orientation.
@@ -292,6 +295,7 @@ struct strack {
     strack_blob blobs[STRACK_CAMERAS][STRACK_MAX_BLOBS];
     int nblobs[STRACK_CAMERAS];
     bool claimed[STRACK_CAMERAS][STRACK_MAX_BLOBS];
+    signed char fitted[STRACK_CAMERAS][STRACK_MAX_BLOBS];   // the hand whose fit matched it this frame, or -1
     int pairs[MAX_PAIRS][2], npairs;    // LEDs close enough together to be seen as neighbours
     float led[2][STRACK_LEDS][3], normal[2][STRACK_LEDS][3];
     hand_state hs[2];
@@ -566,6 +570,27 @@ static bool led_pixel(const strack *t, int hand, int c, const hpose *P, int i, f
 }
 
 typedef struct { int led, blob; float d2; } cand;
+
+// How many LEDs (in each camera) pose P turns squarely enough to a camera, inside its picture, that
+// it should see them: a pose on the wrong dots often turns many more to it than it matches.
+static int expected_leds(const strack *t, int hand, const hpose *P, float facing) {
+    int n = 0;
+    for (int c = 0; c < STRACK_CAMERAS; c++) {
+        if (t->cam[c].off) continue;
+        for (int i = 0; i < STRACK_LEDS; i++) {
+            float w[3], pc[3], nn[3], nc[3], u, v;
+            mv(P->R, t->led[hand][i], w);
+            for (int k = 0; k < 3; k++) w[k] += P->p[k] - t->cam[c].position[k];
+            mtv(t->Rhc[c], w, pc);
+            mv(P->R, t->normal[hand][i], nn);
+            mtv(t->Rhc[c], nn, nc);
+            float d = norm3(pc);
+            if (d < 0.05f || -dot3(nc, pc) / d < facing) continue;
+            if (strack_project(&t->cam[c], pc, &u, &v)) n++;
+        }
+    }
+    return n;
+}
 
 static int cmp_cand(const void *a, const void *b) {
     float x = ((const cand *)a)->d2, y = ((const cand *)b)->d2;
@@ -1170,10 +1195,13 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     int na = match_pose(t, h, P, t->prm.gate_px * 3, ALL_CAMS, all, &sse);
     if (na >= n) keep_sample(t, in, h, &j->pr, P, all, na);
     else keep_sample(t, in, h, &j->pr, P, m, n);
-    for (int i = 0; i < n; i++) t->claimed[m[i].cam][m[i].blob] = true;
-    // Plenty of its dots left unexplained: the fit is turned wrong (the IMU's orientation is off
-    // by more than a follow corrects). Search afresh next frame, more widely.
-    if (claim_around(t, P) >= 6 && n < 10) hs->tracking_poor = true;
+    for (int i = 0; i < n; i++) {
+        t->claimed[m[i].cam][m[i].blob] = true;
+        t->fitted[m[i].cam][m[i].blob] = (signed char)h;
+    }
+    claim_around(t, P);
+    hs->unexplained_check = n < 10;   // counted once both hands are in (strack_solve's end)
+    hs->check_P = *P;
     float R[9], p[3], D[9], e[3];
     world_from_head(in, P, R, p);
     if (j->following && hs->tracking && j->dt > 1e-3f) {
@@ -1203,7 +1231,10 @@ static void accept(strack *t, const strack_input *in, int h, hand_job *j, const 
     mat_to_quat(R, o->pose.q);
     memcpy(o->pose.p, p, sizeof p);
     o->yaw_error = e[1];
+    o->tilt_error[0] = e[0];
+    o->tilt_error[1] = e[2];
     o->leds = n;
+    o->expected = expected_leds(t, h, P, 0.5f);
     o->rms_px = rms;
 }
 
@@ -1213,9 +1244,27 @@ static bool search_hand(strack *t, hand_job *j, hpose *P, match *m, int *n, floa
     return *n >= (j->locked ? 4 : t->prm.min_leds) && *rms <= rms_limit(t, *n) && reachable(P);
 }
 
+// Dots near pose P that no fit this frame matched, the other hand's included.
+static int unexplained_near(const strack *t, const hpose *P) {
+    int n = 0;
+    for (int c = 0; c < STRACK_CAMERAS; c++) {
+        float w[3], pc[3];
+        for (int k = 0; k < 3; k++) w[k] = P->p[k] - t->cam[c].position[k];
+        mtv(t->Rhc[c], w, pc);
+        float d = norm3(pc);
+        if (d < 0.05f) continue;
+        float reach = cosf(atanf(0.12f / d));
+        for (int b = 0; b < t->nblobs[c]; b++)
+            if (t->fitted[c][b] < 0 && dot3(t->blobs[c][b].ray, pc) / d > reach) n++;
+    }
+    return n;
+}
+
 void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
     memset(out, 0, 2 * sizeof *out);
     memset(t->claimed, 0, sizeof t->claimed);
+    memset(t->fitted, -1, sizeof t->fitted);
+    t->hs[0].unexplained_check = t->hs[1].unexplained_check = false;
     float Rh[9], upw[3] = {0, 1, 0};
     quat_to_mat(in->head.q, Rh);
     hand_job jobs[2];
@@ -1331,6 +1380,14 @@ void strack_solve(strack *t, const strack_input *in, strack_result out[2]) {
         jobs[h].following = false;
         accept(t, in, h, &jobs[h], &sp[h], sm[h], sn[h], srms[h], true, &out[h]);
     }
+
+    // Plenty of its dots left unexplained, by its fit or the other hand's: the fit is turned wrong
+    // (the IMU's orientation is off by more than a follow corrects). Search afresh next frame, more
+    // widely. (Counted before the other hand had matched its dots, two controllers held close
+    // together made each other search afresh every frame, and flip between fits turned 30
+    // degrees apart.)
+    for (int h = 0; h < 2; h++)
+        if (t->hs[h].unexplained_check && unexplained_near(t, &t->hs[h].check_P) >= t->prm.poor_dots) t->hs[h].tracking_poor = true;
 
     if (t->prm.calibrate && t->ncal >= 15 && t->cal_new >= 8 && in->time_ns - t->last_cal_ns > 2000000000LL) {
         t->last_cal_ns = in->time_ns;
