@@ -1794,7 +1794,12 @@ static void *status_thread(void *arg) {
     (void)arg;
     bool was_down = false, recentered = false, ps_down[2] = {false, false}, cal_asked = false, hold_asked = false;
     int64_t connected_since = 0, last_stats = axr_now_ns(), last_press = 0, down_since = 0;
+    bool passthrough_asked = !getenv("PSVR2XR_PASSTHROUGH");   // to start in passthrough, for tests
     for (;;) {
+        if (!passthrough_asked && g_usb && axr_now_ns() - last_stats > 3000000000LL) {
+            passthrough_asked = true;
+            toggle_passthrough();
+        }
         struct timespec d = {0, 50000000};
         nanosleep(&d, NULL);
         int64_t now = axr_now_ns();
