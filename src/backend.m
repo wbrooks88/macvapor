@@ -43,6 +43,8 @@ void axr_log(const char *fmt, ...) {
     if (g_logfile) { fputs(line, g_logfile); fflush(g_logfile); }
 }
 
+const char *axr_system_name(void) { return "Apple Vision Pro (ALVR)"; }
+
 int64_t axr_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -806,6 +808,7 @@ static axr_pose from_alvr(AlvrPose p) {
 
 axr_motion axr_device_motion(int device, int64_t time) {
     axr_motion m = {0};
+    if (device < 0 || device >= AXR_DEVICE_COUNT) return m;   // no eye tracking through ALVR
     pthread_mutex_lock(&g_lock);
     bool connected = g_connected;
     uint64_t ts = client_ts_for(time);
@@ -890,4 +893,28 @@ uint64_t axr_input_generation(void) {
 void axr_haptics(int hand, float duration_s, float frequency, float amplitude) {
     if (hand != AXR_LEFT && hand != AXR_RIGHT) return;
     alvr_send_haptics(g_device_id[hand], duration_s, frequency, amplitude);
+}
+
+// No eye tracking or quad views through ALVR: the runtime lists neither, so these are never
+// reached with a quad-view session.
+bool axr_backend_has_eye_tracker(void) { return false; }
+bool axr_eye_tracking(void) { return false; }
+bool axr_foveated_supported(void) { return false; }
+
+void axr_foveated_sizes(uint32_t outer[2], uint32_t inset[2]) {
+    axr_recommended_eye_size(&outer[0], &outer[1]);
+    inset[0] = outer[0];
+    inset[1] = outer[1];
+}
+
+void axr_foveated_inset(int64_t time, bool gaze, float fov[2][4]) {
+    (void)time; (void)gaze;
+    axr_views v = axr_current_views();
+    memcpy(fov, v.fov, sizeof v.fov);
+}
+
+void axr_submit_quad(int64_t display_time, const axr_eye_image eyes[4], const float inset_fov[2][4],
+                     id<MTLCommandQueue> queue) {
+    (void)inset_fov;
+    axr_submit(display_time, eyes, queue);
 }
