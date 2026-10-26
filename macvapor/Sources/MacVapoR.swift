@@ -6,6 +6,7 @@
 // loader's active_runtime.json names.
 
 import AppKit
+import CoreAudio
 import CoreGraphics
 import IOKit
 import SwiftUI
@@ -473,6 +474,9 @@ final class Model: ObservableObject {
             case .extended: break
             }
         }
+        if target == .psvr2 && !Audio.setDefaultOutput(named: "PS VR2") {
+            notes.append("the PS VR2's sound output wasn't found, so sound stays where it was (is the headset on?)")
+        }
         NSWorkspace.shared.open(URL(string: "steam://rungameid/\(game.id)")!)
         output = "Starting \(game.name) through Steam." + (notes.isEmpty ? "" : " Note: " + notes.joined(separator: "; ") + ".")
     }
@@ -598,6 +602,17 @@ final class Model: ObservableObject {
 
     /// Runs the setup script for one game; `then` runs once it has succeeded.
     func setUp(_ game: Game, exe: String, undo: Bool, then: (@MainActor () -> Void)? = nil) {
+        // As the game is now: one installed or updated since the list was made may have changed
+        // kind (an install that downloaded nothing has no openvr_api.dll to find).
+        let game = GameScanner.scan().first { $0.id == game.id } ?? game
+        // An OpenVR game needs OpenComposite; fetch it rather than stop.
+        if game.kind == .openVR && !undo && !hasOpenComposite {
+            downloadOpenComposite { [weak self] in
+                guard let self, self.hasOpenComposite else { return }
+                self.setUp(game, exe: exe, undo: undo, then: then)
+            }
+            return
+        }
         var env = ProcessInfo.processInfo.environment
         env["GFX"] = "dxmt"
         env["WOX"] = Paths.wineopenxr.path
@@ -653,7 +668,7 @@ final class Model: ObservableObject {
 
     // MARK: OpenComposite
 
-    func downloadOpenComposite() {
+    func downloadOpenComposite(then done: (@MainActor () -> Void)? = nil) {
         let url = URL(string: "https://znix.xyz/OpenComposite/download.php?arch=x64&branch=openxr")!
         busy = true
         output = "Downloading OpenComposite…"
@@ -670,11 +685,48 @@ final class Model: ObservableObject {
                 try data.write(to: Paths.openComposite, options: .atomic)
                 Model.clearQuarantine(Paths.openComposite.deletingLastPathComponent())
                 output = "OpenComposite downloaded (\(data.count / 1024) KB)."
+                busy = false
+                done?()
+                return
             } catch {
                 output = "OpenComposite download failed: \(error.localizedDescription)"
             }
             busy = false
         }
+    }
+}
+
+/// The Mac's sound output: the PS VR2's earphone jack is an output called "PS VR2" (over DisplayPort).
+enum Audio {
+    /// Makes the output device of that name the default one (and the one for alerts); false if
+    /// there is none.
+    static func setDefaultOutput(named name: String) -> Bool {
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return false }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return false }
+        for id in ids {
+            var nameAddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal,
+                                                      mElement: kAudioObjectPropertyElementMain)
+            var cf: Unmanaged<CFString>?
+            var n = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            guard AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &n, &cf) == noErr, let devName = cf?.takeRetainedValue() as String?,
+                  devName == name else { continue }
+            // It has to be an output.
+            var streams = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeOutput,
+                                                     mElement: kAudioObjectPropertyElementMain)
+            var ssize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &ssize) == noErr, ssize > 0 else { continue }
+            var dev = id
+            for sel in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultSystemOutputDevice] {
+                var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+                AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &dev)
+            }
+            return true
+        }
+        return false
     }
 }
 
@@ -779,14 +831,17 @@ enum GameScanner {
                 if id == "228980" || id == "250820" { continue }   // Steamworks redistributables, SteamVR
                 if games.contains(where: { $0.id == id }) { continue }
                 let dir = apps.appending(path: "common/\(installdir)")
-                var exes: [String] = []
+                var exes: [String] = [], openVRDLLs: [String] = []
                 var kind = Game.Kind.other
                 if let walker = fm.enumerator(at: dir, includingPropertiesForKeys: nil) {
                     for case let url as URL in walker {
                         // Unreal keeps openvr_api.dll seven levels down, in Engine/Binaries/ThirdParty/OpenVR/....
                         if walker.level > 8 { walker.skipDescendants(); continue }
                         let file = url.lastPathComponent.lowercased()
-                        if file == "openvr_api.dll" { kind = .openVR }
+                        if file == "openvr_api.dll" {
+                            kind = .openVR
+                            openVRDLLs.append(String(url.path.dropFirst(dir.path.count + 1)))
+                        }
                         if file == "openxr_loader.dll" && kind == .other { kind = .openXR }
                         if file.hasSuffix(".exe") && !notGames.contains(where: { file.hasPrefix($0) }) {
                             exes.append(String(url.path.dropFirst(dir.path.count + 1)))
@@ -798,10 +853,15 @@ enum GameScanner {
                                 Paths.steam.appending(path: "steamapps/compatdata/\(id)/pfx")]
                 let prefix = prefixes.first { fm.fileExists(atPath: $0.appending(path: "system.reg").path) }
                 // NotProton's setup stages wineopenxr for Steam; neutron's only puts it in system32.
-                let configured = prefix.map {
+                var configured = prefix.map {
                     fm.fileExists(atPath: $0.appending(path: "drive_c/Program Files (x86)/Steam/aarch64-windows/wineopenxr.dll").path)
                         || fm.fileExists(atPath: $0.appending(path: "drive_c/windows/system32/wineopenxr64.json").path)
                 } ?? false
+                // An OpenVR game is set up only once OpenComposite stands in for its openvr_api.dlls,
+                // which the setup keeps beside it as openvr_api.dll.orig.
+                if kind == .openVR && configured {
+                    configured = openVRDLLs.allSatisfy { fm.fileExists(atPath: dir.appending(path: $0 + ".orig").path) }
+                }
                 games.append(Game(id: id, name: name, dir: dir, prefix: prefix, exes: exes, kind: kind,
                                   configured: configured, graphics: graphics(in: options[id])))
             }
