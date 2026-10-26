@@ -1,7 +1,9 @@
 # MacVapoR on a PlayStation VR2
 
-**Status: written but not yet run on hardware.** Expect to fix things on the first tries; the
-logs below are what to send back.
+**Status: works on one setup** (a Mac mini M6 on macOS 27, with Sony's PC adapter): Aircar, an
+OpenVR game, plays in the headset through neutron at 120 Hz, with sound, eye tracking, and the
+Sense controllers tracked by the headset's cameras. Other Macs, headsets and games are untried, so
+expect to fix things; the logs below are what to send back.
 
 This branch adds a second backend to alvrxr. In place of streaming to an Apple Vision Pro over
 ALVR, it drives a PS VR2 plugged into the Mac through Sony's PC adapter. Games run as in
@@ -25,7 +27,8 @@ What works in this first stage:
 - The controllers' position, from the headset's two lower cameras watching the controllers'
   infrared LEDs (see [Controller tracking](#controller-tracking)). Where the cameras can't see a
   controller (behind your back, above your head) an arm model places it: an elbow at your side
-  and a forearm that turns with the controller. Untested in the headset so far.
+  and a forearm that turns with the controller. The cameras read the headset's own LED spot
+  finder, and each controller's accelerometer carries its position between camera frames.
 
 Room-scale position for the head is experimental (see `positional` below).
 
