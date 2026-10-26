@@ -1068,7 +1068,7 @@ struct ContentView: View {
             ? "Close the game before setting it up."
             : "In NotProton, set the game's graphics to DXMT. Close the game before setting it up."
         let after = model.target == .psvr2
-            ? "Then put the headset on, wake the Sense controllers, and press Play. The controllers turn but don't track position, so games where you reach for things work less well."
+            ? "Then put the headset on, wake the Sense controllers, and press Play. Hold the controllers out in front for a moment so the headset's cameras find them; a controller out of their view (behind you) follows an arm model until they see it again."
             : "Then open ALVR on the Vision Pro with the controllers awake, and press Play."
         return before + " " + after
     }
