@@ -205,10 +205,19 @@ final class Model: ObservableObject {
         guard let d = NSDictionary(contentsOf: plist) else { return false }
         return d["CFBundleExecutable"] as? String == "steam_neutron"
     }
+    /// Steam Play is on for all games with neutron (the "0" entry of Steam's CompatToolMapping);
+    /// neutron's Steam helper can no longer turn it on, and a Steam update can turn it off.
+    var steamPlayAll: Bool {
+        let config = Paths.home.appending(path: "Library/Application Support/Steam/config/config.vdf")
+        guard let text = try? String(contentsOf: config, encoding: .utf8) else { return false }
+        return text.range(of: #""CompatToolMapping"\s*\{[^}]*?"0"\s*\{\s*"name"\s*"neutron_proton""#, options: .regularExpression) != nil
+    }
+    /// A Steam update undid what neutron needs (the hook or Steam Play), and the installer can put it back.
+    var steamNeedsRepair: Bool { hasNeutron && canInstallNeutron && (!steamHooked || !steamPlayAll) }
     var canInstallNeutron: Bool { FileManager.default.fileExists(atPath: Paths.bundledNeutronInstaller.path) }
     /// Everything for neutron and the PS VR2 is in place: what the Install Everything button checks.
     var everythingInstalled: Bool {
-        installedVersion == bundleVersion && hasNeutron && steamHooked && (!bundleHasPSVR2 || hasPSVR2Runtime)
+        installedVersion == bundleVersion && hasNeutron && steamHooked && steamPlayAll && (!bundleHasPSVR2 || hasPSVR2Runtime)
     }
     var hasOpenComposite: Bool { FileManager.default.fileExists(atPath: Paths.openComposite.path) }
     /// This copy of the app carries the PS VR2 runtime, and it has been installed.
@@ -318,16 +327,23 @@ final class Model: ObservableObject {
     func installEverything() {
         installRuntime()
         if hasPSVR2Runtime { setTarget(.psvr2) }
-        guard canInstallNeutron, !hasNeutron || !steamHooked else {
+        guard canInstallNeutron, !hasNeutron || !steamHooked || !steamPlayAll else {
             refresh()
             return
         }
+        runNeutronInstaller(hasNeutron ? "Putting neutron back into Steam after a Steam update; Steam quits and starts again…"
+                                       : "Installing neutron: downloading about 260 MB, then Steam quits and starts again. This takes a few minutes…")
+    }
+
+    /// Runs the bundled neutron installer (which also only repairs Steam's hook and Steam Play when
+    /// neutron is there), showing its output; then, if it worked, done.
+    func runNeutronInstaller(_ message: String, then done: (() -> Void)? = nil) {
         var env = ProcessInfo.processInfo.environment
         if FileManager.default.fileExists(atPath: Paths.bundledNode.appending(path: "node").path) {
             env["NODE_DIR"] = Paths.bundledNode.path
         }
         busy = true
-        output = "Installing neutron: downloading about 260 MB, then Steam quits and starts again. This takes a few minutes…"
+        output = message
         Task.detached {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -348,10 +364,13 @@ final class Model: ObservableObject {
             } catch {
                 text = "Could not run the neutron installer: \(error.localizedDescription)"
             }
+            let ok = text.range(of: "(neutron install failed") == nil && !text.hasPrefix("Could not run")
+            let shown = text
             await MainActor.run {
-                self.output = text
+                self.output = shown
                 self.busy = false
                 self.refresh()
+                if ok, let done { done() }
             }
         }
     }
@@ -413,6 +432,14 @@ final class Model: ObservableObject {
     /// With neutron, Play does the setup too: a game not started yet is started once so neutron
     /// makes its prefix, and one with a prefix is set up first and then started.
     func playOrSetUp(_ game: Game, exe: String) {
+        // A Steam update may have undone neutron's hook or Steam Play; put them back first.
+        if steamNeedsRepair {
+            runNeutronInstaller("A Steam update undid neutron's setup; putting it back (Steam quits and starts again)…") { [weak self] in
+                guard let self, !self.steamNeedsRepair else { return }
+                self.playOrSetUp(game, exe: exe)
+            }
+            return
+        }
         if game.configured || game.prefix == nil || exe.isEmpty {
             play(game)
             if game.prefix == nil {
@@ -428,6 +455,13 @@ final class Model: ObservableObject {
 
     /// Starts a set-up game through Steam, which runs it with NotProton as its compatibility tool.
     func play(_ game: Game) {
+        if steamNeedsRepair {
+            runNeutronInstaller("A Steam update undid neutron's setup; putting it back (Steam quits and starts again)…") { [weak self] in
+                guard let self, !self.steamNeedsRepair else { return }
+                self.play(game)
+            }
+            return
+        }
         var notes: [String] = []
         if target == .psvr2 {
             psvr2Settings.save()
