@@ -203,7 +203,7 @@ void strack_default_params(strack_params *p) {
 }
 
 // The camera's axes in the head: OpenCV's x right, y down, z forward, turned by yaw, pitch, roll.
-static void camera_rotation(const strack_camera *c, float R[9]) {
+void strack_camera_rotation(const strack_camera *c, float R[9]) {
     float Ry[9], Rx[9], Rz[9], C[9] = {1, 0, 0, 0, -1, 0, 0, 0, -1}, t[9];
     float y[3] = {0, 1, 0}, x[3] = {1, 0, 0}, z[3] = {0, 0, 1};
     axis_angle(y, c->yaw_deg * DEG, Ry);
@@ -317,7 +317,7 @@ strack *strack_create(const strack_camera cameras[STRACK_CAMERAS], const strack_
     if (!t->gray || !t->seen || !t->stack || !t->hot) { strack_destroy(t); return NULL; }
     for (int i = 0; i < STRACK_CAMERAS; i++) {
         t->base[i] = t->cam[i] = cameras[i];
-        camera_rotation(&cameras[i], t->Rhc[i]);
+        strack_camera_rotation(&cameras[i], t->Rhc[i]);
     }
     t->prm = *params;
     for (int h = 0; h < 2; h++)
@@ -916,7 +916,7 @@ static void camera_with(const strack_camera *base, const float d[CP], strack_cam
     out->f *= expf(d[3]);
     out->cx += d[4];
     out->cy += d[5];
-    camera_rotation(out, R);
+    strack_camera_rotation(out, R);
 }
 
 // A kept frame's residuals with cameras cams/Rhc and the controller at P: pixel errors, then the

@@ -145,6 +145,8 @@ void strack_shift_yaw(strack *t, int hand, float angle);
 // The camera model, exposed for tests and the capture tool.
 bool strack_project(const strack_camera *c, const float p_cam[3], float *u, float *v);
 void strack_unproject(const strack_camera *c, float u, float v, float ray[3]);
+// The camera's axes (x right, y down, z forward) in the head's, as a row-major 3x3.
+void strack_camera_rotation(const strack_camera *c, float R[9]);
 
 // The LED model: left (0) or right (1), LED i, position (m) and facing (unit).
 void strack_led(int hand, int i, float pos[3], float normal[3]);

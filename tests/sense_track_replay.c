@@ -215,7 +215,8 @@ int main(int argc, char **argv) {
     strack_camera cams[STRACK_CAMERAS];
     strack_default_cameras(cams);
     if (argc > 3 && !strcmp(argv[3], "capture")) {
-        snprintf(path, sizeof path, "%s/controller_cameras.json", argv[1]);
+        if (getenv("CAMFILE")) snprintf(path, sizeof path, "%s", getenv("CAMFILE"));
+        else snprintf(path, sizeof path, "%s/controller_cameras.json", argv[1]);
         FILE *f = fopen(path, "r");
         static char js[16384];
         size_t n = f ? fread(js, 1, sizeof js - 1, f) : 0;
